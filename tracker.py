@@ -12,15 +12,9 @@ For each leg (CE, PE):   above = close > P      red = open > close
   - any leg closed above P in a RED candle        -> INVALID
   - else a leg closed above P in a GREEN candle   -> VALID
   - else (neither leg closed above P)             -> INVALID
-
-Separately, it checks whether the CE (or PE) closed above the BEP of its own
-strike (see bep.py). The first time that happens for a match, a BEP alert is
-raised (once per match) and the row is flagged. This is independent of the
-Valid/Invalid result.
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Optional
 
 import config
 import market_utils
@@ -37,9 +31,6 @@ class PendingTrack:
     expiry: str
     bucket_start: datetime   # IST-aware start of the match candle
     bucket_end: datetime     # IST-aware end of the match candle (when we can read it)
-    ce_bep: Optional[float] = None   # BEP of the CE's strike (None if unavailable)
-    pe_bep: Optional[float] = None   # BEP of the PE's strike (None if unavailable)
-    bep_alerted: bool = False        # the BEP alert fires at most once per match
 
 
 def bucket_bounds(t: datetime):
@@ -83,21 +74,6 @@ def evaluate(ce_candle, pe_candle, price: int) -> dict:
             "state": "valid" if valid else "invalid"}
 
 
-def check_bep(track, ce_candle, pe_candle):
-    """Did the CE close above its strike's BEP, or the PE above its own?
-    Returns {"hits": [...], "text": "..."} or None. A leg whose BEP is unknown
-    is simply skipped."""
-    hits = []
-    if track.ce_bep is not None and ce_candle[4] > track.ce_bep:
-        hits.append({"leg": "CE", "strike": track.ce_strike, "close": ce_candle[4], "bep": track.ce_bep})
-    if track.pe_bep is not None and pe_candle[4] > track.pe_bep:
-        hits.append({"leg": "PE", "strike": track.pe_strike, "close": pe_candle[4], "bep": track.pe_bep})
-    if not hits:
-        return None
-    text = " + ".join(f"{h['leg']} {h['close']:.2f} > BEP {h['bep']:.2f}" for h in hits)
-    return {"hits": hits, "text": text}
-
-
 def process_pending(client, pending: list, now: datetime) -> list:
     """
     Judges every pending match whose candle has closed (plus a short delay so
@@ -132,19 +108,6 @@ def process_pending(client, pending: list, now: datetime) -> list:
 
         fields = {"check_till": track.bucket_end.strftime("%H:%M")}
         fields.update(evaluate(ce_c, pe_c, track.price))
-
-        if not track.bep_alerted:
-            hit = check_bep(track, ce_c, pe_c)
-            if hit:
-                track.bep_alerted = True
-                candle_end = track.bucket_end.strftime("%H:%M")
-                fields.update({
-                    "bep_hit": True,
-                    "bep_alert": f"{hit['text']} (candle till {candle_end})",
-                    "_bep_alert": {**hit, "candle_end": candle_end,   # consumed by app.py, not a table field
-                                   "ce_strike": track.ce_strike, "pe_strike": track.pe_strike,
-                                   "price": track.price},
-                })
 
         pending.remove(track)
         updates.append((track.row_id, fields, True))

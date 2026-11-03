@@ -24,7 +24,7 @@ class StateManager:
     def should_recalculate(self, now: datetime) -> bool:
         if self.state.frozen:
             return False
-        if self.state.window is None:
+        if self.state.window is None or self.state.last_recalc_at is None:
             return True
         elapsed = (now - self.state.last_recalc_at).total_seconds()
         return elapsed >= config.RECALC_INTERVAL_SECONDS

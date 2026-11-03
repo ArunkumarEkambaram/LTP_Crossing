@@ -9,6 +9,26 @@ import config
 IST = pytz.timezone("Asia/Kolkata")
 
 
+def _parse_hhmm(text: str):
+    hh, mm = text.split(":")
+    return int(hh), int(mm)
+
+
+def is_market_open(now=None) -> bool:
+    """True on a weekday (not in config.MARKET_HOLIDAYS) between config.MARKET_OPEN
+    (inclusive) and config.MARKET_CLOSE (exclusive), IST. `now` defaults to the current
+    IST time; a naive datetime is treated as IST."""
+    now = now or datetime.now(IST)
+    if now.tzinfo is not None:
+        now = now.astimezone(IST)
+    if now.weekday() >= 5 or now.strftime("%Y-%m-%d") in config.MARKET_HOLIDAYS:
+        return False
+    minutes = now.hour * 60 + now.minute
+    open_h, open_m = _parse_hhmm(config.MARKET_OPEN)
+    close_h, close_m = _parse_hhmm(config.MARKET_CLOSE)
+    return open_h * 60 + open_m <= minutes < close_h * 60 + close_m
+
+
 def nearest_strike(ltp: float, interval: int = config.STRIKE_INTERVAL) -> int:
     """Rounds Nifty LTP to the nearest tradable strike."""
     return int(round(ltp / interval) * interval)

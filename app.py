@@ -1,17 +1,8 @@
 """
 app.py — NiceGUI entry point for the CE/PE Match Alert tool.
-
-Layout: a status row (Nifty LTP, current strike window, cooldown state)
-plus a live scan log. A ui.timer drives the polling loop.
-
-Both the Live Scanner and Backtest match tables have an inline, editable
-"Comment" column (last column) so you can annotate each match as it comes
-in — useful for judging whether the strategy is actually working. Comments
-are kept in-memory against each row and are included when you download
-CSV/XLSX.
 """
 from datetime import datetime
-from nicegui import ui
+from nicegui import ui, run
 
 import config
 import upstox_client
@@ -23,16 +14,17 @@ import backtest
 import export_utils
 import tracker
 import bep
+from bep_monitor import BepMonitor
 from state_manager import StateManager
 
 state_mgr = StateManager()
+bep_monitor = BepMonitor()
 client = upstox_client.UpstoxClient(config.UPSTOX_ACCESS_TOKEN)
 
 log_lines = []
-log_area = None  # assigned inside main_page
-token_connected = False  # gates the poll loop from running with a bad/blank token
+log_area = None
+token_connected = False
 
-# Column set shared by both tables: comment is always last, per your request
 MATCH_COLUMNS = [
     {"name": "time", "label": "Time", "field": "time"},
     {"name": "ce_strike", "label": "CE Strike", "field": "ce_strike"},
@@ -46,26 +38,26 @@ EXPORT_COLUMNS = [("time", "Time"), ("ce_strike", "CE Strike"),
                   ("pe_strike", "PE Strike"), ("ce_ltp", "CE LTP"), ("pe_ltp", "PE LTP"),
                   ("price", "Rounded Price"), ("comment", "Comment")]
 
-# Live table = the match columns + the 5-minute follow-up result (tracker.py) + BEP info.
-LIVE_MATCH_COLUMNS = MATCH_COLUMNS[:-1] + [
+LIVE_MATCH_COLUMNS = [
+    {"name": "time", "label": "Time", "field": "time"},
+    {"name": "ce_strike", "label": "CE Strike", "field": "ce_strike"},
+    {"name": "pe_strike", "label": "PE Strike", "field": "pe_strike"},
+    {"name": "price", "label": "Rounded Price", "field": "price"},
     {"name": "check_till", "label": "Checked Till", "field": "check_till"},
-    {"name": "touched", "label": "Touched P", "field": "touched"},
     {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
-    {"name": "result", "label": "Result", "field": "result"},
-    {"name": "ce_bep", "label": "CE BEP", "field": "ce_bep"},
-    {"name": "pe_bep", "label": "PE BEP", "field": "pe_bep"},
-    {"name": "bep_alert", "label": "BEP Alert", "field": "bep_alert"},
-    MATCH_COLUMNS[-1],  # comment stays last
 ]
-LIVE_EXPORT_COLUMNS = EXPORT_COLUMNS[:-1] + [
-    ("check_till", "Checked Till"), ("touched", "Touched P"),
-    ("closed_above", "Closed Above"),
-    ("result", "Result"), ("ce_bep", "CE BEP"), ("pe_bep", "PE BEP"),
-    ("bep_alert", "BEP Alert"), EXPORT_COLUMNS[-1],
+LIVE_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in LIVE_MATCH_COLUMNS]
+
+BOARD_COLUMNS = [
+    {"name": "strike", "label": "Strike", "field": "strike", "align": "left"},
+    {"name": "ltp", "label": "LTP", "field": "ltp", "align": "right"},
+    {"name": "bep", "label": "BEP", "field": "bep", "align": "right"},
+    {"name": "time", "label": "Time", "field": "time", "align": "right"},
 ]
 
-# The inline-editable comment cell: a q-input bound to the row, which emits
-# an event back to Python on blur so the comment is captured for export.
+SUPPORT_GREEN = ("rgb(200,230,201)", "#1b3d1e")
+SUPPORT_RED = ("rgb(255,205,210)", "#7f1d1d")
+
 COMMENT_CELL_SLOT = '''
     <q-td key="comment" :props="props">
         <q-input v-model="props.row.comment" dense placeholder="notes..."
@@ -73,29 +65,13 @@ COMMENT_CELL_SLOT = '''
     </q-td>
 '''
 
-
-# Same editable comment cell, but the cell is coloured like the rest of its row:
-# amber when a BEP alert fired, else green when Valid, light red when Invalid.
-LIVE_COMMENT_CELL_SLOT = '''
-    <q-td key="comment" :props="props"
-          :class="props.row.bep_hit ? 'bg-amber-3' : (props.row.state === 'valid' ? 'bg-green-2' : (props.row.state === 'invalid' ? 'bg-red-1' : ''))">
-        <q-input v-model="props.row.comment" dense placeholder="notes..."
-            @blur="() => $parent.$emit('%(event_name)s', props.row)" />
-    </q-td>
-'''
-
-
 def log(msg: str):
     log_lines.append(msg)
-    del log_lines[:-200]  # keep last 200 lines in memory
+    del log_lines[:-200]
     if log_area is not None:
         log_area.set_content("\n".join(log_lines[-40:]))
 
-
 def make_comment_sync_handler(table):
-    """Returns a handler that writes an edited comment back into table.rows,
-    matched by the row's unique 'id' (not by time — multiple matches in the
-    same scan cycle can share the same timestamp)."""
     def handler(e):
         updated_row = e.args
         for row in table.rows:
@@ -104,38 +80,28 @@ def make_comment_sync_handler(table):
                 break
     return handler
 
-
 @ui.page("/")
 def main_page():
     global log_area, token_connected
 
-    # Ask for browser notification permission once, on load
+    ui.add_head_html('''
+        <style>
+            .q-btn { border-radius: 8px !important; transition: all 0.2s ease-in-out !important; }
+            .q-btn:hover { transform: translateY(-1px); box-shadow: 0 4px 6px rgba(0,0,0,0.15); filter: brightness(0.95); }
+        </style>
+    ''')
+
     ui.run_javascript("""
         if (Notification.permission !== "granted" && Notification.permission !== "denied") {
             Notification.requestPermission();
         }
     """)
 
-    # ---------------------------------------------------------- Sidebar: Telegram settings
     with ui.left_drawer(value=True, fixed=False).classes("bg-gray-100 p-4") as drawer:
         ui.label("Telegram Settings").classes("text-lg font-bold")
-
-        tg_token_input = ui.input(
-            "Bot Token",
-            value=config.TELEGRAM_BOT_TOKEN,
-            password=True,
-            password_toggle_button=True,
-        ).classes("w-full")
-
-        tg_chat_id_input = ui.input(
-            "Chat ID(s) — comma-separated for multiple accounts",
-            value=config.TELEGRAM_CHAT_ID,
-        ).classes("w-full")
-
-        tg_status_label = ui.label(
-            "Status: not configured" if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID)
-            else "Status: unverified"
-        )
+        tg_token_input = ui.input("Bot Token", value=config.TELEGRAM_BOT_TOKEN, password=True, password_toggle_button=True).classes("w-full")
+        tg_chat_id_input = ui.input("Chat ID(s) — comma-separated", value=config.TELEGRAM_CHAT_ID).classes("w-full")
+        tg_status_label = ui.label("Status: not configured" if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID) else "Status: unverified")
 
         def save_and_test_telegram():
             bot_token = tg_token_input.value.strip()
@@ -149,12 +115,11 @@ def main_page():
             all_ok, results = telegram_bot.test_telegram(bot_token, chat_id_raw)
             succeeded = [cid for cid, ok, _ in results if ok]
             failed = [(cid, err) for cid, ok, err in results if not ok]
-            config.TELEGRAM_ENABLED = len(succeeded) > 0  # keep alerts on if at least one recipient works
+            config.TELEGRAM_ENABLED = len(succeeded) > 0
 
             if all_ok:
                 tg_status_label.set_text(f"Status: connected — test sent to {len(succeeded)} chat ID(s)")
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram saved and verified "
-                    f"({len(succeeded)} chat ID(s)).")
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram saved and verified ({len(succeeded)} chat ID(s)).")
             else:
                 fail_txt = "; ".join(f"{cid} ({err})" for cid, err in failed)
                 if succeeded:
@@ -164,114 +129,143 @@ def main_page():
                 log(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram test — failures: {fail_txt}")
 
         ui.button("Save & Test Telegram", on_click=save_and_test_telegram).classes("w-full")
+        
+        ui.separator()
+        ui.label("BEP file").classes("text-lg font-bold")
 
-    with ui.row().classes("items-center"):
+        async def handle_bep_upload(e):
+            if hasattr(e, "file"):
+                data, name = await e.file.read(), getattr(e.file, "name", "")
+            else:
+                data, name = e.content.read(), getattr(e, "name", "")
+            ok, msg, warns = bep.load_csv(data, name)
+            bep_upload_label.set_text(("✅ " if ok else "❌ ") + msg)
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP upload ({name}): {msg}")
+            bep_status_label.set_text(bep.status_text())
+            if ok:
+                bep_monitor.reset_backfill()
+                render_board()
+                render_first_cards()
+                render_latest_cards()
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP board reset; re-checking all candles since 09:15.")
+            try:
+                bep_upload.reset()
+            except Exception:
+                pass
+
+        bep_upload = ui.upload(on_upload=handle_bep_upload, auto_upload=True, max_files=1).props("accept=.csv").classes("hidden")
+        ui.button("Upload BEP CSV", icon="upload_file", on_click=lambda: bep_upload.run_method('pickFiles')).classes("w-full")
+            
+        bep_upload_label = ui.label("")
+        bep_status_label = ui.label(bep.status_text()).classes("text-sm text-gray-600")
+
+        ui.separator()
+        ui.label("Upstox").classes("text-lg font-bold")
+        with ui.column().classes("w-full gap-1"):
+            token_input = ui.input("Upstox Access Token", value=config.UPSTOX_ACCESS_TOKEN, password=True, password_toggle_button=True).classes("w-full")
+            connection_label = ui.label("Status: not connected" if not config.UPSTOX_ACCESS_TOKEN else "Status: unverified")
+
+        def save_and_test_token():
+            global token_connected
+            token = token_input.value.strip()
+            if not token:
+                connection_label.set_text("Status: token is empty")
+                token_connected = False
+                return
+            client.access_token = token
+            client.headers["Authorization"] = f"Bearer {token}"
+            ok, info = upstox_client.test_connection(token)
+            if ok:
+                connection_label.set_text(f"Status: connected ({info})")
+                token_connected = True
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] Upstox token saved and verified.")
+            else:
+                connection_label.set_text(f"Status: connection failed — {info}")
+                token_connected = False
+                log(f"[{datetime.now().strftime('%H:%M:%S')}] Token test failed: {info}")
+
+        ui.button("Save & Test Connection", on_click=save_and_test_token).classes("w-full")
+
+        ui.separator()
+        ui.label("Scanner").classes("text-lg font-bold")
+        with ui.column().classes("w-full gap-1"):
+            default_total_strikes = 2 * config.STRIKES_EACH_SIDE + 1
+            strike_slider = ui.slider(min=1, max=11, step=2, value=default_total_strikes).classes("w-full")
+            strike_count_label = ui.label(f"Currently: {default_total_strikes} strikes (center ± {config.STRIKES_EACH_SIDE})")
+
+        def save_strike_count():
+            n = int(strike_slider.value)
+            config.STRIKES_EACH_SIDE = (n - 1) // 2
+            strike_count_label.set_text(f"Currently: {n} strikes (center ± {config.STRIKES_EACH_SIDE})")
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Strike count set to {n}.")
+
+        ui.button("Save Strike Count", on_click=save_strike_count).classes("w-full")
+        
+        # ---------------------------------------------------- NEW RESCAN BUTTON
+        def force_rescan():
+            # 1. Unfreeze the live scanner
+            state_mgr.state.frozen = False
+            state_mgr.state.frozen_until = None
+            state_mgr.state.last_recalc_at = None
+            
+            # 2. Wipe the BEP monitor's morning memory
+            bep_monitor.reset_backfill()
+            
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 Manual rescan triggered: The app is re-scanning from 09:15 with the current window.")
+            
+        ui.button("Rescan from 09:15", on_click=force_rescan, color="orange") \
+            .classes("w-full").props("icon=restart_alt")
+        # ----------------------------------------------------
+
+        with ui.column().classes("w-full gap-1"):
+            scan_interval_input = ui.number("Scan interval (seconds)", value=config.SCAN_INTERVAL_SECONDS, min=1, step=1).classes("w-full")
+            scan_interval_label = ui.label(f"Currently: every {config.SCAN_INTERVAL_SECONDS}s")
+
+        def save_scan_interval():
+            try:
+                n = int(scan_interval_input.value)
+            except (TypeError, ValueError):
+                scan_interval_label.set_text("Enter a whole number of seconds.")
+                return
+            if n < 1:
+                scan_interval_label.set_text("Must be at least 1 second — not applied.")
+                return
+            config.SCAN_INTERVAL_SECONDS = n
+            scan_timer.interval = n
+            scan_interval_label.set_text(f"Currently: every {n}s")
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Scan interval set to {n}s.")
+
+        ui.button("Save Scan Interval", on_click=save_scan_interval).classes("w-full")
+
+    def apply_alert_state():
+        paused = config.ALERTS_PAUSED
+        alert_btn.set_text("Resume alerts" if paused else "Pause alerts")
+        alert_btn.props("color=green icon=notifications_active" if paused else "color=primary icon=notifications_off")
+        paused_badge.set_visibility(paused)
+
+    def toggle_alerts():
+        config.ALERTS_PAUSED = not config.ALERTS_PAUSED
+        apply_alert_state()
+        if config.ALERTS_PAUSED:
+            ui.notify("Alerts paused", type="warning")
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Alerts PAUSED")
+        else:
+            ui.notify("Alerts resumed", type="positive")
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Alerts RESUMED")
+
+    with ui.row().classes("items-center gap-4"):
         ui.button(icon="menu", on_click=drawer.toggle).props("flat round")
         ui.label("Nifty CE = PE Match Alert").classes("text-2xl font-bold")
+        alert_btn = ui.button("Pause alerts", icon="notifications_off", on_click=toggle_alerts)
+        paused_badge = ui.badge("ALERTS PAUSED").props("color=red")
+        apply_alert_state()
 
     with ui.tabs().classes("w-full") as tabs:
         live_tab = ui.tab("Live Scanner")
         backtest_tab = ui.tab("Backtest")
 
     with ui.tab_panels(tabs, value=live_tab).classes("w-full"):
-
-        # ======================================================== LIVE SCANNER TAB
         with ui.tab_panel(live_tab):
-
-            # ---------------------------------------------------- Upstox token settings
-            with ui.row().classes("gap-3 items-center"):
-                token_input = ui.input(
-                    "Upstox Access Token",
-                    value=config.UPSTOX_ACCESS_TOKEN,
-                    password=True,
-                    password_toggle_button=True,
-                ).classes("w-96")
-                connection_label = ui.label(
-                    "Status: not connected" if not config.UPSTOX_ACCESS_TOKEN else "Status: unverified"
-                )
-
-            def save_and_test_token():
-                global token_connected
-                token = token_input.value.strip()
-                if not token:
-                    connection_label.set_text("Status: token is empty")
-                    token_connected = False
-                    return
-                client.access_token = token
-                client.headers["Authorization"] = f"Bearer {token}"
-                ok, info = upstox_client.test_connection(token)
-                if ok:
-                    connection_label.set_text(f"Status: connected ({info})")
-                    token_connected = True
-                    log(f"[{datetime.now().strftime('%H:%M:%S')}] Upstox token saved and verified.")
-                else:
-                    connection_label.set_text(f"Status: connection failed — {info}")
-                    token_connected = False
-                    log(f"[{datetime.now().strftime('%H:%M:%S')}] Token test failed: {info}")
-
-            with ui.row().classes("gap-3"):
-                ui.button("Save & Test Connection", on_click=save_and_test_token)
-
-            # ---------------------------------------------------- Strike count setting
-            with ui.row().classes("gap-3 items-center"):
-                default_total_strikes = 2 * config.STRIKES_EACH_SIDE + 1
-                strike_count_input = ui.number(
-                    "Number of strikes to check",
-                    value=default_total_strikes,
-                    min=1,
-                    step=2,
-                ).classes("w-56")
-                strike_count_label = ui.label(f"Currently: {default_total_strikes} strikes "
-                                               f"(center \u00b1 {config.STRIKES_EACH_SIDE})")
-
-            def save_strike_count():
-                raw = strike_count_input.value
-                try:
-                    n = int(raw)
-                except (TypeError, ValueError):
-                    strike_count_label.set_text("Enter a whole number.")
-                    return
-                if n < 1 or n % 2 == 0:
-                    strike_count_label.set_text(
-                        f"Must be an odd number (1, 3, 5, 7...) since it's always "
-                        f"center \u00b1 N. Got {n} — not applied."
-                    )
-                    return
-                config.STRIKES_EACH_SIDE = (n - 1) // 2
-                strike_count_label.set_text(f"Currently: {n} strikes (center \u00b1 {config.STRIKES_EACH_SIDE})")
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] Strike count set to {n} "
-                    f"(center \u00b1 {config.STRIKES_EACH_SIDE}). Applies from next window recalculation.")
-
-            with ui.row().classes("gap-3"):
-                ui.button("Save Strike Count", on_click=save_strike_count)
-
-            # ---------------------------------------------------- Scan interval setting
-            with ui.row().classes("gap-3 items-center"):
-                scan_interval_input = ui.number(
-                    "Scan interval (seconds)",
-                    value=config.SCAN_INTERVAL_SECONDS,
-                    min=1,
-                    step=1,
-                ).classes("w-56")
-                scan_interval_label = ui.label(f"Currently: every {config.SCAN_INTERVAL_SECONDS}s")
-
-            def save_scan_interval():
-                try:
-                    n = int(scan_interval_input.value)
-                except (TypeError, ValueError):
-                    scan_interval_label.set_text("Enter a whole number of seconds.")
-                    return
-                if n < 1:
-                    scan_interval_label.set_text("Must be at least 1 second — not applied.")
-                    return
-                config.SCAN_INTERVAL_SECONDS = n
-                scan_timer.interval = n  # scan_timer is created further down this page
-                scan_interval_label.set_text(f"Currently: every {n}s")
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] Scan interval set to {n}s.")
-
-            with ui.row().classes("gap-3"):
-                ui.button("Save Scan Interval", on_click=save_scan_interval)
-
             ui.separator()
 
             with ui.row().classes("gap-6 items-center"):
@@ -280,57 +274,154 @@ def main_page():
                 status_label = ui.label("Status: waiting for valid token")
 
             ui.separator()
-            ui.label("Matches Found — type in the Comment column to annotate any row").classes("text-md font-bold")
-            live_matches_table = ui.table(
-                columns=LIVE_MATCH_COLUMNS,
-                rows=[],
-                row_key="id",
-            ).classes("w-full")
-            ROW_STATE_CLASS = ("props.row.bep_hit ? 'bg-amber-3' : (props.row.state === 'valid' ? 'bg-green-2' : "
-                               "(props.row.state === 'invalid' ? 'bg-red-1' : ''))")
-            for col in LIVE_MATCH_COLUMNS:
-                if col["name"] == "comment":
-                    continue
-                live_matches_table.add_slot(
-                    f"body-cell-{col['name']}",
-                    f'<q-td key="{col["name"]}" :props="props" :class="{ROW_STATE_CLASS}">'
-                    f'{{{{ props.value }}}}</q-td>',
-                )
-            live_matches_table.add_slot(
-                "body-cell-comment", LIVE_COMMENT_CELL_SLOT % {"event_name": "live_comment_change"}
-            )
-            live_matches_table.on("live_comment_change", make_comment_sync_handler(live_matches_table))
 
-            def download_live_csv():
-                data = export_utils.build_csv(live_matches_table.rows, LIVE_EXPORT_COLUMNS)
-                ui.download(data, "live_matches.csv")
+            first_cards = {}
+            latest_cards = {}
+            with ui.row().classes("gap-4"):
+                # FIRST CARDS
+                for kind in ("CE", "PE"):
+                    card = ui.card().classes("w-80 rounded-xl shadow-md")
+                    with card:
+                        with ui.row().classes("items-center justify-between w-full no-wrap"):
+                            with ui.row().classes("items-center gap-2 no-wrap"):
+                                ui.icon("circle", color="green" if kind == "CE" else "red").classes("text-3xl")
+                                ui.label(f"First {kind}").classes("text-gray-600")
+                            badge = ui.badge("--").props("color=grey")
+                        name_label = ui.label("--").classes("text-xl font-bold")
+                        detail_label = ui.label("Waiting for first candle").classes("text-sm text-gray-500")
+                    first_cards[kind] = {"card": card, "badge": badge, "name": name_label, "detail": detail_label}
 
-            def download_live_xlsx():
-                data = export_utils.build_xlsx(live_matches_table.rows, LIVE_EXPORT_COLUMNS)
-                ui.download(data, "live_matches.xlsx")
+                # LATEST SUPPORT CARDS
+                for kind in ("CE", "PE"):
+                    card = ui.card().classes("w-80 rounded-xl shadow-md")
+                    with card:
+                        with ui.row().classes("items-center justify-between w-full no-wrap"):
+                            with ui.row().classes("items-center gap-2 no-wrap"):
+                                ui.icon("circle", color="green" if kind == "CE" else "red").classes("text-3xl")
+                                ui.label(f"Latest Support {kind}").classes("text-gray-600")
+                            badge = ui.badge("--").props("color=grey")
+                        name_label = ui.label(f"NO {kind}").classes("text-xl font-bold")
+                        detail_label = ui.label("").classes("text-sm text-gray-500")
+                    latest_cards[kind] = {"card": card, "badge": badge, "name": name_label, "detail": detail_label}
 
-            with ui.row().classes("gap-3"):
-                ui.button("Download CSV", on_click=download_live_csv)
-                ui.button("Download XLSX", on_click=download_live_xlsx)
+            def render_board():
+                view = bep_monitor.board_view()
+                for opt, table in board_tables.items():
+                    rows = []
+                    for r in view.get(opt, []):
+                        row = dict(r)
+                        row["bg"], row["fg"] = SUPPORT_GREEN if r["kind"] == "green" else SUPPORT_RED
+                        rows.append(row)
+                    table.rows = rows
+                    table.update()
 
+            def render_first_cards():
+                view = bep_monitor.first_view or {}
+                for kind, w in first_cards.items():
+                    w["card"].classes(remove="bg-green-2")
+                    leg = view.get(kind)
+                    if not leg:
+                        w["name"].set_text(f"NO {kind}")
+                        w["detail"].set_text("Waiting for first candle")
+                        w["badge"].set_text("--")
+                        w["badge"].props("color=grey")
+                        continue
+                    w["name"].set_text(f"NIFTY {leg['strike']}{kind}")
+                    ltp, level = leg.get("ltp"), leg.get("bep")
+                    w["detail"].set_text(f"BEP {level:.2f} · LTP {ltp:.2f}" if ltp is not None else f"BEP {level:.2f} · LTP --")
+                    if ltp is not None:
+                        gap = ltp - level
+                        w["badge"].set_text(f"{gap:+.2f}")
+                        w["badge"].props(f"color={'green' if gap >= 0 else 'red'}")
+                    else:
+                        w["badge"].set_text("--")
+                        w["badge"].props("color=grey")
+                    w["card"].classes(add="bg-green-2")
+
+            def render_latest_cards():
+                view = bep_monitor.latest_view or {}
+                for kind, w in latest_cards.items():
+                    w["card"].classes(remove="bg-green-2 bg-red-2")
+                    leg = view.get(kind)
+                    if not leg:
+                        w["name"].set_text(f"NO {kind}")
+                        w["detail"].set_text("")
+                        w["badge"].set_text("--")
+                        w["badge"].props("color=grey")
+                        continue
+                    w["name"].set_text(f"NIFTY {leg['strike']}{kind}")
+                    ltp, level = leg.get("ltp"), leg.get("bep")
+                    w["detail"].set_text(f"BEP {level:.2f} · LTP {ltp:.2f}" if ltp is not None else f"BEP {level:.2f} · LTP --")
+                    if ltp is not None:
+                        gap = ltp - level
+                        w["badge"].set_text(f"{gap:+.2f}")
+                        w["badge"].props(f"color={'green' if gap >= 0 else 'red'}")
+                    else:
+                        w["badge"].set_text("--")
+                        w["badge"].props("color=grey")
+                    w["card"].classes(add="bg-green-2" if leg.get("state") == "green" else "bg-red-2")
+
+            ui.separator()
+            ui.label("BEP Support Boards: Green = support confirmed (failed breakdown). Red = broke the original setup wick.").classes("text-xs text-gray-500")
+            
+            with ui.row().classes("w-full no-wrap items-start gap-4"):
+                with ui.column().classes("gap-2").style("flex: 2 1 0; min-width: 0"):
+                    ui.label("Matches Found (CE = PE)").classes("text-md font-bold")
+                    live_matches_table = ui.table(columns=LIVE_MATCH_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
+                    INVALID_CLASS = "props.row.state === 'invalid' ? 'bg-red-1' : ''"
+                    for col in LIVE_MATCH_COLUMNS:
+                        live_matches_table.add_slot(
+                            f"body-cell-{col['name']}",
+                            f'<q-td key="{col["name"]}" :props="props" :class="{INVALID_CLASS}">{{{{ props.value }}}}</q-td>',
+                        )
+
+                    def download_live_csv():
+                        ui.download(export_utils.build_csv(live_matches_table.rows, LIVE_EXPORT_COLUMNS), "live_matches.csv")
+                    def download_live_xlsx():
+                        ui.download(export_utils.build_xlsx(live_matches_table.rows, LIVE_EXPORT_COLUMNS), "live_matches.xlsx")
+
+                    with ui.row().classes("gap-3"):
+                        ui.button("Download CSV", on_click=download_live_csv)
+                        ui.button("Download XLSX", on_click=download_live_xlsx)
+
+                board_tables = {}
+                for opt in ("CE", "PE"):
+                    with ui.column().classes("gap-2").style("flex: 1 1 0; min-width: 0"):
+                        ui.label(f"BEP Support — {opt}").classes("text-md font-bold")
+                        table = ui.table(columns=BOARD_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense flat bordered").style("max-height: 640px; overflow-y: auto")
+                        table.add_slot(
+                            "body",
+                            """
+                            <q-tr :props="props" :style="props.row.bg ? {backgroundColor: props.row.bg, color: props.row.fg} : {}">
+                              <q-td key="strike" :props="props"><span class="text-weight-bold">{{ props.row.strike }}</span></q-td>
+                              <q-td key="ltp" :props="props">{{ props.row.ltp }}</q-td>
+                              <q-td key="bep" :props="props">{{ props.row.bep }}</q-td>
+                              <q-td key="time" :props="props">{{ props.row.time }}</q-td>
+                            </q-tr>
+                            """,
+                        )
+                        board_tables[opt] = table
             ui.separator()
             log_area = ui.markdown("")
 
-            pending_tracks = []  # matches waiting for their 5-min candle to close
+            pending_tracks = []
 
-            def poll():
+            async def poll():
                 if not token_connected:
                     status_label.set_text("Status: waiting for valid token")
                     return
 
-                summary = scanner.run_scan_cycle(client, state_mgr, log_fn=log)
+                market_open = market_utils.is_market_open()
+                summary = scanner.run_scan_cycle(client, state_mgr, log_fn=log, detect=market_open)
 
                 if summary.get("nifty_ltp") is not None:
                     nifty_label.set_text(f"Nifty LTP: {summary['nifty_ltp']}")
                 if summary.get("window"):
                     window_label.set_text(f"Window: {summary['window']}")
 
-                if summary.get("frozen"):
+                if not market_open:
+                    status_label.set_text(f"Status: market closed — match scanning paused (Mon–Fri {config.MARKET_OPEN}–{config.MARKET_CLOSE} IST)")
+                elif summary.get("frozen"):
                     status_label.set_text(f"Status: cooldown ({summary.get('cooldown_remaining')}s left)")
                 else:
                     status_label.set_text("Status: scanning")
@@ -342,67 +433,49 @@ def main_page():
                 if matches:
                     notifier.dispatch_match_alerts(matches, log_fn=log)
                     expiry = state_mgr.state.window.expiry_date if state_mgr.state.window else None
-                    new_rows = []  # collected here, then put at the TOP of the table below
+                    new_rows = []
                     for m in matches:
-                        # The 5-min chart candle containing the match (09:31 -> 09:30-09:35)
-                        bucket_start, bucket_end = tracker.bucket_bounds(
-                            m.triggered_at.astimezone(market_utils.IST)
-                        )
-                        row_id = len(live_matches_table.rows) + len(new_rows)  # unique, never reused
-                        ce_bep = bep.get_bep(client, expiry, m.ce_strike) if expiry else None
-                        pe_bep = bep.get_bep(client, expiry, m.pe_strike) if expiry else None
-                        if ce_bep is None or pe_bep is None:
-                            log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP unavailable for "
-                                f"{'CE ' + str(m.ce_strike) if ce_bep is None else ''}"
-                                f"{' ' if ce_bep is None and pe_bep is None else ''}"
-                                f"{'PE ' + str(m.pe_strike) if pe_bep is None else ''} "
-                                f"(no previous-day close) — no BEP alert for that leg.")
+                        bucket_start, bucket_end = tracker.bucket_bounds(m.triggered_at.astimezone(market_utils.IST))
+                        row_id = len(live_matches_table.rows) + len(new_rows)
                         new_rows.append({
-                            "id": row_id,
-                            "time": m.triggered_at.strftime("%H:%M:%S"),
-                            "ce_strike": m.ce_strike,
-                            "pe_strike": m.pe_strike,
-                            "ce_ltp": round(m.ce_ltp, 2) if m.ce_ltp is not None else None,
-                            "pe_ltp": round(m.pe_ltp, 2) if m.pe_ltp is not None else None,
-                            "price": m.price,
-                            "check_till": bucket_end.strftime("%H:%M"),
-                            "touched": "Tracking...",
-                            "ce_bep": ce_bep,
-                            "pe_bep": pe_bep,
-                            "bep_alert": "",
-                            "bep_hit": False,
-                            "closed_above": "Tracking...",
-                            "result": "Tracking...",
-                            "state": "tracking",
-                            "comment": "",
+                            "id": row_id, "time": m.triggered_at.strftime("%H:%M:%S"),
+                            "ce_strike": m.ce_strike, "pe_strike": m.pe_strike, "price": m.price,
+                            "check_till": bucket_end.strftime("%H:%M"), "closed_above": "Tracking...", "state": "tracking",
                         })
                         if expiry:
                             pending_tracks.append(tracker.PendingTrack(
                                 row_id=row_id, ce_strike=m.ce_strike, pe_strike=m.pe_strike,
-                                price=m.price, expiry=expiry, ce_bep=ce_bep, pe_bep=pe_bep,
-                                bucket_start=bucket_start, bucket_end=bucket_end,
+                                price=m.price, expiry=expiry, bucket_start=bucket_start, bucket_end=bucket_end,
                             ))
-                    live_matches_table.rows[0:0] = new_rows  # newest match goes to the top
+                    live_matches_table.rows[0:0] = new_rows
                     live_matches_table.update()
 
-                # Advance the 5-min follow-up for any match whose candle has now closed
                 if pending_tracks:
                     updates = tracker.process_pending(client, pending_tracks, datetime.now(market_utils.IST))
                     if updates:
                         for row_id, fields, final in updates:
-                            bep_alert = fields.pop("_bep_alert", None)  # alert payload, not a table field
                             for row in live_matches_table.rows:
                                 if row["id"] == row_id:
                                     row.update(fields)
                                     break
-                            if bep_alert:
-                                notifier.dispatch_bep_alert(bep_alert, log_fn=log)
-                                log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP alert for match "
-                                    f"#{row_id}: {bep_alert['text']}")
                             if final:
-                                log(f"[{datetime.now().strftime('%H:%M:%S')}] Match #{row_id} result: "
-                                    f"{fields.get('result')} ({fields.get('closed_above', '')})")
+                                log(f"[{datetime.now().strftime('%H:%M:%S')}] Match #{row_id} result: {fields.get('result')} ({fields.get('closed_above', '')})")
                         live_matches_table.update()
+
+                if summary.get("nifty_ltp") is not None:
+                    try:
+                        hint = state_mgr.state.window.expiry_date if state_mgr.state.window else None
+                        res = await run.io_bound(bep_monitor.step, client, summary["nifty_ltp"], hint, datetime.now(market_utils.IST))
+                        for msg in res["logs"]:
+                            log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+                        if res["board_changed"] or res["recalculated"]:
+                            render_board()
+                        if res.get("first_updated"):
+                            render_first_cards()
+                        if res.get("latest_updated"):
+                            render_latest_cards()
+                    except Exception as ex:
+                        log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP monitor error: {ex}")
 
             scan_timer = ui.timer(config.SCAN_INTERVAL_SECONDS, poll)
 
@@ -426,13 +499,14 @@ def main_page():
                 bt_expiry_label.set_text(f"Expiry: {expiry_str} (Tuesday)")
                 bt_date_select.set_options(dates)
                 if dates:
-                    bt_date_select.set_value(dates[-1])  # default to most recent date
+                    bt_date_select.set_value(dates[-1])
 
             with ui.row().classes("gap-3"):
                 ui.button("Load Expiry Dates", on_click=load_dates)
 
             bt_summary_label = ui.label("")
             bt_run_button = ui.button("Run Backtest")
+            
             ui.label("Matches Found — type in the Comment column to annotate any row").classes("text-md font-bold")
             bt_results_table = ui.table(
                 columns=MATCH_COLUMNS,
@@ -484,6 +558,5 @@ def main_page():
                 bt_results_table.update()
 
             bt_run_button.on_click(run_backtest_click)
-
 
 ui.run(title="CE/PE Match Alert", port=8082, reload=False)

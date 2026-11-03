@@ -56,31 +56,13 @@ def fire_telegram(events: list):
 
 
 def dispatch_match_alerts(events: list, log_fn=print):
-    """Fires all channels for every match event found in a scan cycle."""
+    """Fires all channels for every match event found in a scan cycle (unless alerts are paused)."""
+    if config.ALERTS_PAUSED:
+        log_fn(f"Alerts paused: {len(events)} match alert(s) not sent (toast, browser, Telegram).")
+        return
     for e in events:
         fire_toast(e)
         fire_browser_notification(e)
     ok, err = fire_telegram(events)
     if not ok:
         log_fn(f"Telegram send failed: {err}")
-
-
-def _bep_label(alert: dict) -> str:
-    return f"BEP: {alert['text']} (5-min candle till {alert['candle_end']})"
-
-
-def dispatch_bep_alert(alert: dict, log_fn=print):
-    """Separate alert (toast + browser notification + Telegram) raised when a CE or
-    PE closes above its strike's BEP."""
-    label = _bep_label(alert)
-    ui.notify(label, type="info", position="top", timeout=10000)
-    ui.run_javascript(f"""
-        if (Notification.permission === "granted") {{
-            new Notification("BEP Alert", {{ body: {label!r} }});
-        }}
-    """)
-    if config.TELEGRAM_ENABLED:
-        all_ok, results = telegram_bot.send_message_to_all(telegram_bot.build_bep_message(alert))
-        if not all_ok:
-            failed = "; ".join(f"{cid}: {err}" for cid, ok, err in results if not ok)
-            log_fn(f"Telegram BEP alert failed: {failed}")

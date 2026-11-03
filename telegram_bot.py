@@ -80,18 +80,6 @@ def build_match_message(events: list) -> str:
     return "\n".join(lines)
 
 
-def build_bep_message(alert: dict) -> str:
-    """alert: the dict tracker.py raises when a CE/PE closes above its strike's BEP."""
-    lines = ["\U0001f4c8 *BEP Alert*",
-             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
-    for h in alert["hits"]:
-        lines.append(f"{h['leg']} *{h['strike']}* closed *{h['close']:.2f}* above BEP *{h['bep']:.2f}*")
-    lines.append(f"5-min candle till {alert['candle_end']}")
-    lines.append(f"Match: CE {alert['ce_strike']} / PE {alert['pe_strike']} \u2192 {alert['price']}")
-    lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
-    return "\n".join(lines)
-
-
 def test_telegram(bot_token: str, chat_id: str):
     """Sends a test message to every chat ID. Returns (all_ok, results)
     — same shape as send_message_to_all."""

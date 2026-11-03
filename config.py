@@ -29,3 +29,16 @@ TELEGRAM_ENABLED = True
 
 # Upstox
 UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
+
+# Market hours (IST). New CE = PE matches are only scanned for, and alerted on, between
+# MARKET_OPEN and MARKET_CLOSE on weekdays. Outside these hours the app still shows the
+# Nifty LTP and keeps the BEP boards / follow-ups up to date from candles, but it raises
+# no match alerts (prices are stale). Add exchange holidays as "YYYY-MM-DD" strings.
+MARKET_OPEN = "09:15"
+MARKET_CLOSE = "15:40"
+MARKET_HOLIDAYS = []
+
+# Alert pause switch (top-bar button in the UI). While True, CE = PE matches are still found,
+# tabled and followed up, but NO toast, browser notification or Telegram message is sent.
+# Matches found while paused are not sent after resuming. In-memory only (resets to False).
+ALERTS_PAUSED = False

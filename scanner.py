@@ -11,9 +11,12 @@ import match_logic
 from models import MatchEvent
 
 
-def run_scan_cycle(client, state_mgr, log_fn=print) -> dict:
+def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True) -> dict:
     """
-    Runs a single scan cycle. Returns a summary dict:
+    Runs a single scan cycle. With detect=False (market closed) it only fetches the
+    Nifty LTP and returns {"market_closed": True, ...}: no window work, no option-chain
+    call, no matches and therefore no alerts.
+    Returns a summary dict:
     {nifty_ltp, window, quotes, matches, frozen, cooldown_remaining, errors}
     "matches" is a list of MatchEvent (empty list if none found this cycle).
     """
@@ -32,6 +35,10 @@ def run_scan_cycle(client, state_mgr, log_fn=print) -> dict:
         summary["errors"].append("Nifty LTP not found in response.")
         return summary
     summary["nifty_ltp"] = nifty_ltp
+
+    if not detect:
+        summary["market_closed"] = True
+        return summary
 
     # 2. Determine / recalc strike window (skipped while frozen)
     if state_mgr.should_recalculate(now):
