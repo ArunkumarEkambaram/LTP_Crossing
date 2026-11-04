@@ -28,7 +28,7 @@ TELEGRAM_CHAT_ID = ""
 TELEGRAM_ENABLED = True
 
 # Upstox
-UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
+UPSTOX_ACCESS_TOKEN = "eyJ0eXAiOiJKV1QiLCJrZXlfaWQiOiJza192MS4wIiwiYWxnIjoiSFMyNTYifQ.eyJzdWIiOiI1RUJCRk0iLCJqdGkiOiI2YWVhOGUzMDkzMWQ2MjNhM2JjMjAzNjAiLCJpc011bHRpQ2xpZW50IjpmYWxzZSwiaXNQbHVzUGxhbiI6dHJ1ZSwiaWF0IjoxNzkzNzU2NzIwLCJpc3MiOiJ1ZGFwaS1nYXRld2F5LXNlcnZpY2UiLCJleHAiOjE3OTM4Mjk2MDB9.EsSv4C9c-qIIuAtxypNDu-82HS79WSl1Zrp5gQ2kuRQ"   # paste a pre-generated access token
 
 # Market hours (IST). New CE = PE matches are only scanned for, and alerted on, between
 # MARKET_OPEN and MARKET_CLOSE on weekdays. Outside these hours the app still shows the
@@ -42,3 +42,7 @@ MARKET_HOLIDAYS = []
 # tabled and followed up, but NO toast, browser notification or Telegram message is sent.
 # Matches found while paused are not sent after resuming. In-memory only (resets to False).
 ALERTS_PAUSED = False
+
+# CE = PE match alerts (toast, browser, Telegram). False = matches still appear in the table and
+# are followed up, but no notification is sent. BEP Support alerts are separate and unaffected.
+MATCH_ALERTS_ENABLED = False

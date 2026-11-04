@@ -15,6 +15,7 @@ SESSION_LAST_CANDLE = dtime(15, 25)
 MAX_CATCHUP_CANDLES = 12
 MAX_BACKFILL_CANDLES = 80
 FETCH_WORKERS = 8
+NOTIFY_MAX_AGE = timedelta(minutes=6)   # only a candle that JUST closed may raise a support alert
 
 def classify(candle, bep_level: float):
     high, low, close = float(candle[2]), float(candle[3]), float(candle[4])
@@ -44,6 +45,10 @@ class BepMonitor:
         self.latest_view = {}
         self._latest_sig = None
 
+        self.new_support = []        # fresh support alerts waiting for the app to dispatch
+        self.candle_windows = {}     # candle start -> strikes in THAT candle's ATM window (Nifty close +/- N)
+        self._notified = set()       # (date, strike, opt, time) already alerted; survives Rescan / CSV upload
+
     def _reset_leg_state(self, strike, opt):
         self.leg_states[(strike, opt)] = {
             "state": "idle", "flush_low": None, "active_row_id": None
@@ -59,6 +64,7 @@ class BepMonitor:
         self.leg_states = {}
         self.latest_view = {}
         self._latest_sig = None
+        self.candle_windows = {}
         
         self.first_start = None
         self.first_found = {"CE": None, "PE": None}
@@ -157,6 +163,7 @@ class BepMonitor:
             
             # 1. Normal ATM window for the Support Board
             window_strikes = market_utils.build_strike_window(nifty_close) if nifty_close else list(self.strikes)
+            self.candle_windows[s] = set(window_strikes)
             
             # 2. First CE / First PE ignore the ATM window: while either card is still unfound,
             #    every candle is also scanned for ALL CSV strikes (the board stays on the window).
@@ -201,7 +208,7 @@ class BepMonitor:
         for start in sorted(self.buckets):
             b = self.buckets[start]
             end = start + CANDLE
-            label = end.strftime("%H:%M")
+            label = start.strftime("%H:%M")
             mapping, _ = market_utils.option_instrument_keys(client, b["expiry"])
             mapping = mapping or {}
             
@@ -230,76 +237,122 @@ class BepMonitor:
         start_key = start.strftime("%Y-%m-%dT%H:%M")
         candles = cache.get(ik, [])
         candle = next((c for c in candles if c[0][:16] == start_key), None)
-        
+
         if candle is None:
             if any(c[0][:16] > start_key for c in candles):
                 return True
             return False
-            
+
         level, _src = bep.get_bep(client, self.expiry, strike)
         if level is None:
             return True
 
         o, h, l, c = float(candle[1]), float(candle[2]), float(candle[3]), float(candle[4])
-        
-        # --- 1. FIRST CARD LOGIC (Ignore ATM window, just find the first green touch) ---
+
+        # --- 1. FIRST CARD LOGIC (ignores the ATM window) ---
         if self.first_found[opt] is None:
             if l <= level + 0.05 and c > level and c > o:
                 self.first_found[opt] = strike
-                self.first_view = {} # Force UI redraw
-                # We do NOT return here, so it can also process the board if it happens to be in the window
-        
-        # --- 2. SUPPORT BOARD LOGIC (Strictly ATM Window) ---
-        # If this strike is NOT in the current live ATM window, skip the Board logic
-        if self.strikes and strike not in self.strikes:
-            return True
+                self.first_view = {}  # force UI redraw
+
+        # --- 2. FAILURES of rows this strike already has (every strike, window or not) ---
+        changed = self._check_failures(strike, opt, start, c, label)
+
+        # --- 3. NEW support rows: only strikes in the live ATM window ---
+        window = self.candle_windows.get(start)
+        if window is None:
+            window = set(self.strikes or [])
+        if window and strike not in window:
+            return "changed" if changed else True
 
         if (strike, opt) not in self.leg_states:
             self._reset_leg_state(strike, opt)
         st = self.leg_states[(strike, opt)]
-        
-        changed = False
-        
+
+        # Does a valid Rule 1 setup stand behind this candle? (flush done and validated)
+        setup_low = None
+        if st["state"] == "waiting":
+            setup_low = st["flush_low"]
+        elif st["state"] == "flushing" and o <= level + 0.05 and \
+                (l >= st["flush_low"] or start == self.first_start):
+            setup_low = st["flush_low"]          # this candle is also the validate candle
+
+        # SUPPORT TRIGGER (both rules): green candle, low <= BEP, close > BEP. The open can be anywhere.
+        #   Rule 1 (setup behind it): fails when a later candle closes below the flush candle's low.
+        #   Rule 2 (no setup):        fails when a later candle closes below THIS candle's low.
+        if c > o and c > level and l <= level + 0.05:
+            if not any(r["strike"] == strike and r["time"] == label for r in self.support[opt]):
+                self._add_support(strike, opt, start, label, level, c,
+                                  setup_low if setup_low is not None else l,
+                                  1 if setup_low is not None else 2, now)
+                changed = True
+            self._reset_leg_state(strike, opt)
+            return "changed" if changed else True
+
+        # RULE 1 SETUP: flush -> validate
         if st["state"] == "flushing":
             if o <= level + 0.05:
-                # We keep the first_start exception so the flush doesn't instantly fail on the first candle
                 if l < st["flush_low"] and start != self.first_start:
                     self._reset_leg_state(strike, opt)
                 else:
                     st["state"] = "waiting"
             else:
                 self._reset_leg_state(strike, opt)
-                
         elif st["state"] == "idle":
             if c < level:
                 st["state"] = "flushing"
                 st["flush_low"] = l
-                
-        elif st["state"] == "waiting":
-            if l <= level + 0.05 and c > level and c > o:
-                self._support_seq += 1
-                row_id = self._support_seq
-                self.support[opt].append({
-                    "id": row_id, "strike": strike, "opt": opt, "bep": level,
-                    "time": label, "fail_time": None, "state": "green", "ltp": c,
-                    "resolved": False, "active_flush_low": st["flush_low"]
-                })
-                st["state"] = "active"
-                st["active_row_id"] = row_id
-                changed = True
-                
-        elif st["state"] == "active":
-            if c < st["flush_low"]:
-                for row in self.support[opt]:
-                    if row["id"] == st["active_row_id"]:
-                        row["state"] = "red"
-                        row["fail_time"] = label
-                        row["resolved"] = True
-                        break
-                self._reset_leg_state(strike, opt)
-                changed = True
+        # "waiting": stays until a trigger candle (above) or ... it simply keeps waiting.
 
         return "changed" if changed else True
+
+    def _check_failures(self, strike, opt, start, close, label) -> bool:
+        """A green row turns red when a LATER candle closes below its fail level."""
+        changed = False
+        for row in self.support[opt]:
+            if row["strike"] == strike and row["state"] == "green" and not row["resolved"] \
+                    and row["start"] < start and close < row["active_flush_low"]:
+                row["state"] = "red"
+                row["fail_time"] = label
+                row["resolved"] = True
+                changed = True
+        return changed
+
+    def _add_support(self, strike, opt, start, label, level, close, fail_low, rule, now):
+        self._support_seq += 1
+        row = {
+            "id": self._support_seq, "strike": strike, "opt": opt, "bep": level,
+            "time": label, "start": start, "fail_time": None, "state": "green", "ltp": close,
+            "resolved": False, "active_flush_low": fail_low, "rule": rule,
+        }
+        self.support[opt].append(row)
+        self._queue_support_alert(row, start, now)
+
+    def _queue_support_alert(self, row, start, now):
+        """Queues an alert only for a candle that has JUST closed during market hours. Rows built
+        while replaying the day (Rescan, CSV upload, late start) are old, so they stay silent.
+        Each (date, strike, leg, candle) alerts once, even across a Rescan."""
+        try:
+            key = (start.strftime("%Y-%m-%d"), row["strike"], row["opt"], row["time"])
+            if key in self._notified:
+                return
+            age = now - (start + CANDLE)
+            if not (timedelta(seconds=-30) <= age <= NOTIFY_MAX_AGE):
+                return
+            if not market_utils.is_market_open(now):
+                return
+            self._notified.add(key)
+            self.new_support.append({
+                "strike": row["strike"], "opt": row["opt"], "bep": row["bep"], "close": row["ltp"],
+                "time": row["time"], "rule": row["rule"],
+            })
+        except Exception:
+            pass
+
+    def pop_support_alerts(self) -> list:
+        """Returns (and clears) the support alerts raised since the last call."""
+        out, self.new_support = self.new_support, []
+        return out
 
     def board_view(self) -> dict:
         out = {}

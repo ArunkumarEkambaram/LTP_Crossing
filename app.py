@@ -362,7 +362,9 @@ def main_page():
                     w["card"].classes(add="bg-green-2" if leg.get("state") == "green" else "bg-red-2")
 
             ui.separator()
-            ui.label("BEP Support Boards: Green = support confirmed (failed breakdown). Red = broke the original setup wick.").classes("text-xs text-gray-500")
+            ui.label("BEP Support Boards: Green = a green candle touched BEP (low <= BEP) and closed above it. "
+                     "Red = a later candle closed below the fail level (the flush candle's low if a failed-breakdown "
+                     "setup stood behind it, otherwise the trigger candle's own low). New supports raise a notification.").classes("text-xs text-gray-500")
             
             with ui.row().classes("w-full no-wrap items-start gap-4"):
                 with ui.column().classes("gap-2").style("flex: 2 1 0; min-width: 0"):
@@ -474,6 +476,9 @@ def main_page():
                             render_first_cards()
                         if res.get("latest_updated"):
                             render_latest_cards()
+                        support_alerts = bep_monitor.pop_support_alerts()
+                        if support_alerts:
+                            notifier.dispatch_support_alerts(support_alerts, log_fn=log)
                     except Exception as ex:
                         log(f"[{datetime.now().strftime('%H:%M:%S')}] BEP monitor error: {ex}")
 
