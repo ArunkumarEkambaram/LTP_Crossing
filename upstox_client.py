@@ -190,6 +190,49 @@ class UpstoxClient:
         except Exception as e:
             return None, str(e)
 
+    def fetch_candles(self, instrument_key: str, date_str: str, interval_minutes: int = 5):
+        """
+        N-minute candles for ONE date (historical endpoint for past dates, intraday endpoint for
+        today). Returns (candles_oldest_first, None) or (None, error). Each candle:
+        [timestamp, open, high, low, close, volume, oi]. For today the list includes the candle
+        still forming - the caller must ignore it.
+        """
+        encoded_key = quote(instrument_key, safe="")
+        today_str = datetime.now(IST).strftime("%Y-%m-%d")
+        if date_str == today_str:
+            url = f"{BASE_V3}/historical-candle/intraday/{encoded_key}/minutes/{interval_minutes}"
+        else:
+            url = (f"{BASE_V3}/historical-candle/{encoded_key}/minutes/{interval_minutes}/"
+                   f"{date_str}/{date_str}")
+        try:
+            resp = requests.get(url, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            candles = resp.json().get("data", {}).get("candles", [])
+            return sorted(candles, key=lambda c: c[0]), None
+        except Exception as e:
+            return None, str(e)
+
+    def fetch_close_before(self, instrument_key: str, date_str: str):
+        """
+        Close of the most recent COMPLETED daily candle dated strictly before date_str (looks
+        back 10 days to cover weekends and holidays). Returns (close, None) or (None, error).
+        """
+        encoded_key = quote(instrument_key, safe="")
+        from_date = (datetime.strptime(date_str, "%Y-%m-%d") - timedelta(days=10)).strftime("%Y-%m-%d")
+        url = f"{BASE_V3}/historical-candle/{encoded_key}/days/1/{date_str}/{from_date}"
+        try:
+            resp = requests.get(url, headers=self.headers, timeout=15)
+            if resp.status_code != 200:
+                return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+            candles = resp.json().get("data", {}).get("candles", [])
+            for c in sorted(candles, key=lambda c: c[0], reverse=True):   # newest first
+                if c[0][:10] < date_str:
+                    return c[4], None
+            return None, f"No completed daily candle found in the 10 days before {date_str}"
+        except Exception as e:
+            return None, str(e)
+
     def fetch_previous_day_close(self, instrument_key: str):
         """
         Close of the most recent COMPLETED daily candle, i.e. dated strictly before

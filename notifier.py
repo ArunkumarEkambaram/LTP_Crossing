@@ -82,9 +82,9 @@ def dispatch_support_alerts(events: list, log_fn=print):
     Honours the same Pause alerts switch as the CE = PE match alerts."""
     if not events:
         return
-    if config.ALERTS_PAUSED:
-        log_fn(f"Alerts paused: {len(events)} BEP support alert(s) not sent (toast, browser, Telegram).")
-        return
+    # if config.ALERTS_PAUSED:
+    #     log_fn(f"Alerts paused: {len(events)} BEP support alert(s) not sent (toast, browser, Telegram).")
+    #     return
     for e in events:
         label = _support_label(e)
         ui.notify(label, type="positive", position="top", timeout=10000)

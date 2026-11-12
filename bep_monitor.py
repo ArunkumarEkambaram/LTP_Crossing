@@ -6,10 +6,11 @@ from datetime import timedelta, time as dtime, datetime
 
 import config
 import market_utils
-import tracker
+import support_logic
 import bep
 
-CANDLE = timedelta(minutes=tracker.CANDLE_MINUTES)
+CANDLE_MINUTES = 5
+CANDLE = timedelta(minutes=CANDLE_MINUTES)
 SESSION_FIRST_CANDLE = dtime(9, 15)
 SESSION_LAST_CANDLE = dtime(15, 25)
 MAX_CATCHUP_CANDLES = 12
@@ -45,8 +46,8 @@ class BepMonitor:
         self.latest_view = {}
         self._latest_sig = None
 
-        self.new_support = []        # fresh support alerts waiting for the app to dispatch
         self.candle_windows = {}     # candle start -> strikes in THAT candle's ATM window (Nifty close +/- N)
+        self.new_support = []        # fresh support alerts waiting for the app to dispatch
         self._notified = set()       # (date, strike, opt, time) already alerted; survives Rescan / CSV upload
 
     def _reset_leg_state(self, strike, opt):
@@ -121,7 +122,7 @@ class BepMonitor:
         self.quotes = quotes
 
     def _nifty_closes(self, client, log_fn) -> dict:
-        candles, err = client.fetch_intraday_candles(config.NIFTY_INDEX_KEY, tracker.CANDLE_MINUTES)
+        candles, err = client.fetch_intraday_candles(config.NIFTY_INDEX_KEY, CANDLE_MINUTES)
         if not candles:
             log_fn(f"BEP monitor: Nifty 5-min candles unavailable ({err}); using live window.")
             return {}
@@ -129,7 +130,7 @@ class BepMonitor:
 
     def _latest_closed(self, now):
         t = now - timedelta(seconds=config.TRACK_FINALIZE_DELAY_SECONDS)
-        cur_start, _ = tracker.bucket_bounds(t)
+        cur_start = t.replace(minute=t.minute - t.minute % CANDLE_MINUTES, second=0, microsecond=0)
         latest = cur_start - CANDLE
         if latest.date() != now.date():
             return None
@@ -170,7 +171,7 @@ class BepMonitor:
             if s == first_of_day:
                 self.first_start = s
             strikes_to_scan = window_strikes
-            if self.first_found["CE"] is None or self.first_found["PE"] is None:
+            if config.SUPPORT_SCAN_ALL_CSV_STRIKES or self.first_found["CE"] is None or self.first_found["PE"] is None:
                 csv_strikes = set(getattr(bep, "_csv_bep", {}) or {})
                 if csv_strikes:
                     strikes_to_scan = sorted(set(window_strikes) | csv_strikes)
@@ -192,7 +193,7 @@ class BepMonitor:
             return
 
         def fetch(ik):
-            candles, _ = client.fetch_intraday_candles(ik, tracker.CANDLE_MINUTES)
+            candles, _ = client.fetch_intraday_candles(ik, CANDLE_MINUTES)
             return ik, candles or []
 
         with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as ex:
@@ -255,81 +256,41 @@ class BepMonitor:
                 self.first_found[opt] = strike
                 self.first_view = {}  # force UI redraw
 
-        # --- 2. FAILURES of rows this strike already has (every strike, window or not) ---
-        changed = self._check_failures(strike, opt, start, c, label)
+        # --- 2. FAILURES of rows this strike already has (shared rules: support_logic.py) ---
+        changed = support_logic.check_failures(self.support[opt], strike, start, c, label)
 
-        # --- 3. NEW support rows: only strikes in the live ATM window ---
+        # --- 3. NEW support rows: only strikes in that candle's ATM window ---
         window = self.candle_windows.get(start)
         if window is None:
             window = set(self.strikes or [])
-        if window and strike not in window:
+        if not config.SUPPORT_SCAN_ALL_CSV_STRIKES and window and strike not in window:
             return "changed" if changed else True
 
         if (strike, opt) not in self.leg_states:
             self._reset_leg_state(strike, opt)
         st = self.leg_states[(strike, opt)]
 
-        # Does a valid Rule 1 setup stand behind this candle? (flush done and validated)
-        setup_low = None
-        if st["state"] == "waiting":
-            setup_low = st["flush_low"]
-        elif st["state"] == "flushing" and o <= level + 0.05 and \
-                (l >= st["flush_low"] or start == self.first_start):
-            setup_low = st["flush_low"]          # this candle is also the validate candle
-
-        # SUPPORT TRIGGER (both rules): green candle, low <= BEP, close > BEP. The open can be anywhere.
-        #   Rule 1 (setup behind it): fails when a later candle closes below the flush candle's low.
-        #   Rule 2 (no setup):        fails when a later candle closes below THIS candle's low.
-        if c > o and c > level and l <= level + 0.05:
-            if not any(r["strike"] == strike and r["time"] == label for r in self.support[opt]):
-                self._add_support(strike, opt, start, label, level, c,
-                                  setup_low if setup_low is not None else l,
-                                  1 if setup_low is not None else 2, now)
-                changed = True
-            self._reset_leg_state(strike, opt)
-            return "changed" if changed else True
-
-        # RULE 1 SETUP: flush -> validate
-        if st["state"] == "flushing":
-            if o <= level + 0.05:
-                if l < st["flush_low"] and start != self.first_start:
-                    self._reset_leg_state(strike, opt)
-                else:
-                    st["state"] = "waiting"
-            else:
-                self._reset_leg_state(strike, opt)
-        elif st["state"] == "idle":
-            if c < level:
-                st["state"] = "flushing"
-                st["flush_low"] = l
-        # "waiting": stays until a trigger candle (above) or ... it simply keeps waiting.
-
+        if support_logic.process_candle(
+                st, self.support[opt], strike, opt, level, o, l, c, start, label, self.first_start,
+                lambda s, p, a, lb, lv, cl, fl, rule: self._add_support(s, p, a, lb, lv, cl, fl, rule, now)):
+            changed = True
         return "changed" if changed else True
-
-    def _check_failures(self, strike, opt, start, close, label) -> bool:
-        """A green row turns red when a LATER candle closes below its fail level."""
-        changed = False
-        for row in self.support[opt]:
-            if row["strike"] == strike and row["state"] == "green" and not row["resolved"] \
-                    and row["start"] < start and close < row["active_flush_low"]:
-                row["state"] = "red"
-                row["fail_time"] = label
-                row["resolved"] = True
-                changed = True
-        return changed
 
     def _add_support(self, strike, opt, start, label, level, close, fail_low, rule, now):
         self._support_seq += 1
+        is_first = not any(r["strike"] == strike for r in self.support[opt])   # first support of the day for this strike + leg
         row = {
             "id": self._support_seq, "strike": strike, "opt": opt, "bep": level,
             "time": label, "start": start, "fail_time": None, "state": "green", "ltp": close,
             "resolved": False, "active_flush_low": fail_low, "rule": rule,
         }
         self.support[opt].append(row)
-        self._queue_support_alert(row, start, now)
+        if is_first:                      # later supports of the same strike stay silent (no alert)
+            self._queue_support_alert(row, start, now)
 
     def _queue_support_alert(self, row, start, now):
-        """Queues an alert only for a candle that has JUST closed during market hours. Rows built
+        """Called only for a strike's FIRST support of the day (see _add_support). Queues an alert only
+        for a candle that has JUST closed during market hours. Rows built
         while replaying the day (Rescan, CSV upload, late start) are old, so they stay silent.
         Each (date, strike, leg, candle) alerts once, even across a Rescan."""
         try:
@@ -365,8 +326,14 @@ class BepMonitor:
                     e["strike"]
                 ) if e.get("time") else 0
             )
+            first_id = {}                      # strike -> id of its earliest support row of the day
+            for e in self.support[opt]:
+                cur = first_id.get(e["strike"])
+                if cur is None or (e["start"], e["id"]) < cur[0]:
+                    first_id[e["strike"]] = ((e["start"], e["id"]), e["id"])
             out[opt] = [{
-                "id": str(e["id"]), "strike": str(e["strike"]), "ltp": f"{e['ltp']:.2f}" if e.get("ltp") else "--",
+                "id": str(e["id"]), "strike": str(e["strike"]),
+                "first": first_id[e["strike"]][1] == e["id"], "ltp": f"{e['ltp']:.2f}" if e.get("ltp") else "--",
                 "bep": f"{e['bep']:.2f}",
                 "time": f"{e['time']} → {e['fail_time']}" if e['state'] == 'red' and e.get('fail_time') else e['time'],
                 "kind": e["state"],
