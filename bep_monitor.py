@@ -1,5 +1,5 @@
 """
-bep_monitor.py — watches the strikes near ATM against each strike's BEP.
+bep_monitor.py — watches the strikes near ATM against each strike's BEP, for ONE index (NIFTY or SENSEX).
 """
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta, time as dtime, datetime
@@ -27,7 +27,9 @@ def classify(candle, bep_level: float):
     return None
 
 class BepMonitor:
-    def __init__(self):
+    def __init__(self, name: str = "NIFTY"):
+        self.name = name
+        self.cfg = config.INDEXES[name]      # index_key, underlying_key, strike_interval
         self.strikes = None
         self.last_recalc = None
         self.expiry = None
@@ -46,7 +48,7 @@ class BepMonitor:
         self.latest_view = {}
         self._latest_sig = None
 
-        self.candle_windows = {}     # candle start -> strikes in THAT candle's ATM window (Nifty close +/- N)
+        self.candle_windows = {}     # candle start -> strikes in THAT candle's ATM window (index close +/- N)
         self.new_support = []        # fresh support alerts waiting for the app to dispatch
         self._notified = set()       # (date, strike, opt, time) already alerted; survives Rescan / CSV upload
 
@@ -76,7 +78,7 @@ class BepMonitor:
         self.strikes = None
         self.last_recalc = None
 
-    def step(self, client, nifty_ltp: float, expiry_hint, now) -> dict:
+    def step(self, client, index_ltp: float, expiry_hint, now) -> dict:
         logs = []
         log_fn = logs.append
         result = {"board_changed": False, "recalculated": False, "first_updated": False,
@@ -84,13 +86,13 @@ class BepMonitor:
         if expiry_hint:
             self.expiry = expiry_hint
         if not self.expiry:
-            self.expiry = market_utils.current_weekly_expiry(client)
+            self.expiry = market_utils.current_weekly_expiry(client, self.cfg["underlying_key"])
         if not self.expiry:
-            log_fn("BEP monitor: could not determine weekly expiry.")
+            log_fn(f"BEP monitor {self.name}: could not determine weekly expiry.")
             return result
 
         if self.strikes is None or (now - self.last_recalc).total_seconds() >= config.RECALC_INTERVAL_SECONDS:
-            self.strikes = market_utils.build_strike_window(nifty_ltp)
+            self.strikes = market_utils.build_strike_window(index_ltp, self.cfg["strike_interval"])
             self.last_recalc = now
             self._refresh_quotes(client, log_fn)
             result["recalculated"] = True
@@ -102,29 +104,29 @@ class BepMonitor:
         try:
             result["first_updated"] = self._update_first(client, result["recalculated"] or result["board_changed"], log_fn)
         except Exception as ex:
-            log_fn(f"BEP first cards error: {ex}")
+            log_fn(f"BEP {self.name} first cards error: {ex}")
             
         try:
             result["latest_updated"] = self._update_latest(
                 client, result["recalculated"] or result["board_changed"], log_fn)
         except Exception as ex:
-            log_fn(f"BEP latest-support cards error: {ex}")
+            log_fn(f"BEP {self.name} latest-support cards error: {ex}")
         return result
 
     def _refresh_quotes(self, client, log_fn):
         strikes = sorted(set(self.strikes or []) | self._card_strikes())
         quotes, err = client.fetch_ce_pe_ltp_for_strikes(
-            config.NIFTY_OPTION_UNDERLYING_KEY, self.expiry, strikes
+            self.cfg["underlying_key"], self.expiry, strikes
         )
         if quotes is None:
-            log_fn(f"BEP monitor: option chain fetch failed: {err}")
+            log_fn(f"BEP monitor {self.name}: option chain fetch failed: {err}")
             return
         self.quotes = quotes
 
     def _nifty_closes(self, client, log_fn) -> dict:
-        candles, err = client.fetch_intraday_candles(config.NIFTY_INDEX_KEY, CANDLE_MINUTES)
+        candles, err = client.fetch_intraday_candles(self.cfg["index_key"], CANDLE_MINUTES)
         if not candles:
-            log_fn(f"BEP monitor: Nifty 5-min candles unavailable ({err}); using live window.")
+            log_fn(f"BEP monitor {self.name}: {self.name} 5-min candles unavailable ({err}); using live window.")
             return {}
         return {c[0][:16]: float(c[4]) for c in candles}
 
@@ -141,6 +143,7 @@ class BepMonitor:
     def _schedule(self, client, now, log_fn):
         if self.last_bucket is not None and self.last_bucket.date() != now.date():
             self.last_bucket = None
+            self.expiry = None            # re-read the expiry on the next step (it may have rolled over)
             self._reset_support()
             
         latest = self._latest_closed(now)
@@ -163,7 +166,7 @@ class BepMonitor:
             nifty_close = closes.get(s.strftime("%Y-%m-%dT%H:%M"))
             
             # 1. Normal ATM window for the Support Board
-            window_strikes = market_utils.build_strike_window(nifty_close) if nifty_close else list(self.strikes)
+            window_strikes = market_utils.build_strike_window(nifty_close, self.cfg["strike_interval"]) if nifty_close else list(self.strikes)
             self.candle_windows[s] = set(window_strikes)
             
             # 2. First CE / First PE ignore the ATM window: while either card is still unfound,
@@ -172,7 +175,7 @@ class BepMonitor:
                 self.first_start = s
             strikes_to_scan = window_strikes
             if config.SUPPORT_SCAN_ALL_CSV_STRIKES or self.first_found["CE"] is None or self.first_found["PE"] is None:
-                csv_strikes = set(getattr(bep, "_csv_bep", {}) or {})
+                csv_strikes = bep.csv_strikes(self.name)
                 if csv_strikes:
                     strikes_to_scan = sorted(set(window_strikes) | csv_strikes)
 
@@ -182,7 +185,7 @@ class BepMonitor:
     def _prefetch(self, client, cache):
         iks = set()
         for b in self.buckets.values():
-            mapping, _ = market_utils.option_instrument_keys(client, b["expiry"])
+            mapping, _ = market_utils.option_instrument_keys(client, b["expiry"], self.cfg["underlying_key"])
             mapping = mapping or {}
             for strike in b["strikes"]:
                 for opt in ("CE", "PE"):
@@ -210,7 +213,7 @@ class BepMonitor:
             b = self.buckets[start]
             end = start + CANDLE
             label = start.strftime("%H:%M")
-            mapping, _ = market_utils.option_instrument_keys(client, b["expiry"])
+            mapping, _ = market_utils.option_instrument_keys(client, b["expiry"], self.cfg["underlying_key"])
             mapping = mapping or {}
             
             for strike in b["strikes"]:
@@ -244,7 +247,7 @@ class BepMonitor:
                 return True
             return False
 
-        level, _src = bep.get_bep(client, self.expiry, strike)
+        level, _src = bep.get_bep(client, self.expiry, strike, self.name)
         if level is None:
             return True
 
@@ -304,7 +307,7 @@ class BepMonitor:
                 return
             self._notified.add(key)
             self.new_support.append({
-                "strike": row["strike"], "opt": row["opt"], "bep": row["bep"], "close": row["ltp"],
+                "index": self.name, "strike": row["strike"], "opt": row["opt"], "bep": row["bep"], "close": row["ltp"],
                 "time": row["time"], "rule": row["rule"],
             })
         except Exception:
@@ -340,6 +343,35 @@ class BepMonitor:
             } for e in evs]
         return out
 
+    def export_rows(self) -> list:
+        """Every BEP Support row of this index, CE and PE together, oldest first (for the XLSX download)."""
+        first = {}                                        # (opt, strike) -> earliest (start, id)
+        for opt in ("CE", "PE"):
+            for e in self.support[opt]:
+                k = (opt, e["strike"])
+                if k not in first or (e["start"], e["id"]) < first[k]:
+                    first[k] = (e["start"], e["id"])
+        rows = []
+        for opt in ("CE", "PE"):
+            for e in self.support[opt]:
+                failed = e["state"] == "red"
+                rows.append({
+                    "_sort": (e["start"], 0 if opt == "CE" else 1, e["strike"]),
+                    "index": self.name, "opt": opt, "strike": e["strike"],
+                    "first": "Yes" if first[(opt, e["strike"])] == (e["start"], e["id"]) else "",
+                    "bep": round(e["bep"], 2), "time": e["time"],
+                    "setup": "Failed breakdown" if e.get("rule") == 1 else "Touch and go",
+                    "fail_level": round(e["active_flush_low"], 2) if e.get("active_flush_low") is not None else "",
+                    "status": "Failed" if failed else "Held",
+                    "fail_time": e.get("fail_time") or "" if failed else "",
+                    "fail_close": round(e["fail_close"], 2) if failed and e.get("fail_close") is not None else "",
+                    "ltp": round(e["ltp"], 2) if e.get("ltp") else "",
+                })
+        rows.sort(key=lambda r: r["_sort"])
+        for r in rows:
+            del r["_sort"]
+        return rows
+
     # ------------------------------------------------------------------ First CE / PE Cards
     def _card_strikes(self) -> set:
         s = set()
@@ -353,7 +385,7 @@ class BepMonitor:
         if not refresh and self.first_view:
             return False
             
-        mapping, _ = market_utils.option_instrument_keys(client, self.expiry)
+        mapping, _ = market_utils.option_instrument_keys(client, self.expiry, self.cfg["underlying_key"])
         mapping = mapping or {}
         view = {}
         for opt in ("CE", "PE"):
@@ -364,7 +396,7 @@ class BepMonitor:
                 continue
 
             strike = found
-            level, _ = bep.get_bep(client, self.expiry, strike)
+            level, _ = bep.get_bep(client, self.expiry, strike, self.name)
             ltp = (self.quotes.get(strike) or {}).get(opt)
             if ltp is None:
                 ik = mapping.get(strike, {}).get(opt)
@@ -390,7 +422,7 @@ class BepMonitor:
         sig = {opt: (e["id"], e["state"]) if e else None for opt, e in events.items()}
         if sig == self._latest_sig and not refresh and self.latest_view:
             return False
-        mapping, _ = market_utils.option_instrument_keys(client, self.expiry)
+        mapping, _ = market_utils.option_instrument_keys(client, self.expiry, self.cfg["underlying_key"])
         mapping = mapping or {}
         view = {}
         for opt, e in events.items():

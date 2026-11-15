@@ -8,8 +8,17 @@ NIFTY_INDEX_KEY = "NSE_INDEX|Nifty 50"
 # Underlying key used for option-chain / option-expiry lookups
 NIFTY_OPTION_UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 
-STRIKE_INTERVAL = 50        # Nifty strike spacing
-STRIKES_EACH_SIDE = 2       # nearest strike +/- 2 -> 5 strikes total
+# Indices the BEP Support monitor can watch. "enabled" is the starting state of the NIFTY / SENSEX
+# checkboxes in the top bar (changed at runtime from the UI). A disabled index is not polled at all.
+INDEXES = {
+    "NIFTY":  {"index_key": "NSE_INDEX|Nifty 50", "underlying_key": "NSE_INDEX|Nifty 50",
+               "strike_interval": 50,  "enabled": True},
+    "SENSEX": {"index_key": "BSE_INDEX|SENSEX",   "underlying_key": "BSE_INDEX|SENSEX",
+               "strike_interval": 100, "enabled": False},
+}
+
+STRIKE_INTERVAL = 50        # Nifty strike spacing (used by the Nifty-only backtest)
+STRIKES_EACH_SIDE = 2       # nearest strike +/- 2 -> 5 strikes total (same count for every index)
 
 # Live scan interval (seconds). Editable at runtime from the Live Scanner tab.
 SCAN_INTERVAL_SECONDS = 10
@@ -48,3 +57,12 @@ SUPPORT_SCAN_ALL_CSV_STRIKES = True
 # fail level within this many 5-minute candles AFTER the trigger candle (3 = 15 minutes).
 # After that the row stays green whatever the price does later. 0 = no limit (old behaviour).
 SUPPORT_FAIL_WINDOW_CANDLES = 3
+
+# ---------------------------------------------------------------- CE = PE (LTP crossing)
+# Master switch = the "CE = PE" checkbox in the top bar (default on). It applies to every enabled index.
+CE_PE_ENABLED = True
+COOLDOWN_SECONDS = 5 * 60         # freeze the window + suppress further matches for 5 min after a match
+COOLDOWN_GRACE_SECONDS = 0        # optional early-unfreeze tolerance (not needed at this scan rate)
+# CE = PE alerts (toast, browser, Telegram). False = matches still appear in the table and are followed
+# up, but no notification is sent. BEP Support alerts are separate and unaffected.
+MATCH_ALERTS_ENABLED = False

@@ -2,7 +2,7 @@
 state_manager.py — owns the freeze/cooldown/recalculation decisions.
 
 Rules (per finalized design):
-- Every RECALC_INTERVAL_SECONDS, recalc the strike window from live Nifty LTP,
+- Every RECALC_INTERVAL_SECONDS, recalc the strike window from the live index LTP (one StateManager per index),
   but ONLY if not currently frozen.
 - The moment any match(es) are found in a scan cycle: freeze the window
   (stop recalculating) and suppress further alerts, for COOLDOWN_SECONDS.
@@ -18,7 +18,9 @@ from models import ScanState, StrikeWindow, MatchEvent
 
 
 class StateManager:
-    def __init__(self):
+    def __init__(self, index: str = "NIFTY"):
+        self.index = index
+        self.interval = config.INDEXES[index]["strike_interval"]
         self.state = ScanState()
 
     def should_recalculate(self, now: datetime) -> bool:
@@ -30,9 +32,9 @@ class StateManager:
         return elapsed >= config.RECALC_INTERVAL_SECONDS
 
     def recalculate_window(self, nifty_ltp: float, expiry_date: str, now: datetime) -> StrikeWindow:
-        strikes = market_utils.build_strike_window(nifty_ltp)
+        strikes = market_utils.build_strike_window(nifty_ltp, self.interval)
         self.state.window = StrikeWindow(
-            center_strike=market_utils.nearest_strike(nifty_ltp),
+            center_strike=market_utils.nearest_strike(nifty_ltp, self.interval),
             strikes=strikes,
             calculated_at=now,
             expiry_date=expiry_date,

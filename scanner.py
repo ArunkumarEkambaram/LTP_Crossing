@@ -1,5 +1,5 @@
 """
-scanner.py — one scan cycle: get Nifty LTP, get CE/PE LTPs for the tracked
+scanner.py — one scan cycle for one index (NIFTY or SENSEX): get the index LTP, get CE/PE LTPs for the tracked
 strike window, check for cross-strike CE == PE matches (any CE value
 matching any PE value within the window — see match_logic.py).
 """
@@ -11,30 +11,35 @@ import match_logic
 from models import MatchEvent
 
 
-def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True) -> dict:
+def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True,
+                   index: str = "NIFTY", index_ltp=None) -> dict:
     """
-    Runs a single scan cycle. With detect=False (market closed) it only fetches the
+    Runs a single scan cycle for ONE index (`index` = "NIFTY" or "SENSEX"; `index_ltp` = its spot LTP
+    if the caller already fetched it, otherwise it is fetched here). With detect=False (market closed) it only fetches the
     Nifty LTP and returns {"market_closed": True, ...}: no window work, no option-chain
     call, no matches and therefore no alerts.
     Returns a summary dict:
     {nifty_ltp, window, quotes, matches, frozen, cooldown_remaining, errors}
     "matches" is a list of MatchEvent (empty list if none found this cycle).
     """
-    summary = {"nifty_ltp": None, "window": None, "quotes": {}, "matches": [], "errors": []}
+    summary = {"nifty_ltp": None, "index_ltp": None, "window": None, "quotes": {}, "matches": [], "errors": []}
+    cfg = config.INDEXES[index]
     now = datetime.now()
 
     state_mgr.maybe_unfreeze(now)
 
-    # 1. Nifty spot LTP
-    ltp_map, err = client.fetch_ltp([config.NIFTY_INDEX_KEY])
-    if ltp_map is None:
-        summary["errors"].append(f"Nifty LTP fetch failed: {err}")
-        return summary
-    nifty_ltp = ltp_map.get(config.NIFTY_INDEX_KEY)
+    # 1. index spot LTP
+    nifty_ltp = index_ltp
     if nifty_ltp is None:
-        summary["errors"].append("Nifty LTP not found in response.")
-        return summary
-    summary["nifty_ltp"] = nifty_ltp
+        ltp_map, err = client.fetch_ltp([cfg["index_key"]])
+        if ltp_map is None:
+            summary["errors"].append(f"{index} LTP fetch failed: {err}")
+            return summary
+        nifty_ltp = ltp_map.get(cfg["index_key"])
+        if nifty_ltp is None:
+            summary["errors"].append(f"{index} LTP not found in response.")
+            return summary
+    summary["nifty_ltp"] = summary["index_ltp"] = nifty_ltp
 
     if not detect:
         summary["market_closed"] = True
@@ -42,9 +47,9 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True) -> dict
 
     # 2. Determine / recalc strike window (skipped while frozen)
     if state_mgr.should_recalculate(now):
-        expiry = market_utils.current_weekly_expiry(client)
+        expiry = market_utils.current_weekly_expiry(client, cfg["underlying_key"])
         if expiry is None:
-            summary["errors"].append("Could not determine weekly expiry.")
+            summary["errors"].append(f"{index}: could not determine weekly expiry.")
             return summary
         window = state_mgr.recalculate_window(nifty_ltp, expiry, now)
     else:
@@ -63,7 +68,7 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True) -> dict
 
     # 3. Fetch CE/PE LTPs for the tracked strikes
     quotes, err = client.fetch_ce_pe_ltp_for_strikes(
-        config.NIFTY_OPTION_UNDERLYING_KEY, window.expiry_date, window.strikes
+        cfg["underlying_key"], window.expiry_date, window.strikes
     )
     if quotes is None:
         summary["errors"].append(f"Option chain fetch failed: {err}")
@@ -75,13 +80,13 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True) -> dict
     if raw_matches:
         events = [
             MatchEvent(ce_strike=m["ce_strike"], pe_strike=m["pe_strike"], price=m["price"],
-                       triggered_at=now, ce_ltp=m["ce_ltp"], pe_ltp=m["pe_ltp"])
+                       triggered_at=now, ce_ltp=m["ce_ltp"], pe_ltp=m["pe_ltp"], index=index)
             for m in raw_matches
         ]
         state_mgr.register_matches(events, now)
         summary["matches"] = events
         for e in events:
-            log_fn(f"[{now.strftime('%H:%M:%S')}] MATCH: CE@{e.ce_strike} ({e.ce_ltp}) = "
+            log_fn(f"[{now.strftime('%H:%M:%S')}] {index} MATCH: CE@{e.ce_strike} ({e.ce_ltp}) = "
                    f"PE@{e.pe_strike} ({e.pe_ltp}) -> {e.price}")
 
     return summary

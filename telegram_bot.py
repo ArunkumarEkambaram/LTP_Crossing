@@ -64,18 +64,19 @@ def send_message_to_all(message: str, bot_token: str = None, chat_id: str = None
 
 
 def build_match_message(events: list) -> str:
-    """events: list of MatchEvent — builds one message covering all matches
+    """events: list of MatchEvent - builds one message covering all CE = PE matches
     found in a single scan cycle."""
     lines = ["\U0001f3af *CE = PE Match*",
              "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
     for e in events:
         time_label = e.triggered_at.strftime("%H:%M:%S")
+        idx = getattr(e, "index", "NIFTY")
         ce_txt = f"{e.ce_ltp:.2f}" if e.ce_ltp is not None else "-"
         pe_txt = f"{e.pe_ltp:.2f}" if e.pe_ltp is not None else "-"
         if e.ce_strike == e.pe_strike:
-            lines.append(f"[{time_label}] Strike *{e.ce_strike}*: CE {ce_txt} / PE {pe_txt} \u2192 *{e.price:.0f}*")
+            lines.append(f"[{time_label}] {idx} strike *{e.ce_strike}*: CE {ce_txt} / PE {pe_txt} \u2192 *{e.price:.0f}*")
         else:
-            lines.append(f"[{time_label}] CE *{e.ce_strike}* ({ce_txt}) / PE *{e.pe_strike}* ({pe_txt}) \u2192 *{e.price:.0f}*")
+            lines.append(f"[{time_label}] {idx} CE *{e.ce_strike}* ({ce_txt}) / PE *{e.pe_strike}* ({pe_txt}) \u2192 *{e.price:.0f}*")
     lines.append("\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501")
     return "\n".join(lines)
 
@@ -86,7 +87,7 @@ def build_support_message(events: list) -> str:
     lines = ["\U0001f7e2 *BEP Support*", bar]
     for e in events:
         how = "failed breakdown" if e.get("rule") == 1 else "touch and go"
-        lines.append(f"[{e['time']}] {e['opt']} *{e['strike']}* \u2022 BEP {e['bep']:.2f} \u2022 "
+        lines.append(f"[{e['time']}] {e.get('index', 'NIFTY')} {e['opt']} *{e['strike']}* \u2022 BEP {e['bep']:.2f} \u2022 "
                      f"close {e['close']:.2f} \u2022 {how}")
     lines.append(bar)
     return "\n".join(lines)
@@ -95,5 +96,5 @@ def build_support_message(events: list) -> str:
 def test_telegram(bot_token: str, chat_id: str):
     """Sends a test message to every chat ID. Returns (all_ok, results)
     — same shape as send_message_to_all."""
-    msg = "\u2705 *CE/PE Match Alert* \u2014 Telegram connected successfully!"
+    msg = "\u2705 *BEP Support Monitor* \u2014 Telegram connected successfully!"
     return send_message_to_all(msg, bot_token, chat_id)

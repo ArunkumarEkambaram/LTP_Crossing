@@ -24,6 +24,7 @@ class MatchEvent:
     triggered_at: datetime
     ce_ltp: Optional[float] = None   # actual unrounded CE price
     pe_ltp: Optional[float] = None   # actual unrounded PE price
+    index: str = "NIFTY"             # which index the match is from (NIFTY / SENSEX)
 
 
 @dataclass

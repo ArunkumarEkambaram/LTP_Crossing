@@ -1,5 +1,5 @@
 """
-market_utils.py — Nifty LTP -> nearest strike -> strike window helpers.
+market_utils.py — index LTP -> nearest strike -> strike window helpers (Nifty and Sensex).
 """
 from datetime import datetime, timedelta
 import pytz
@@ -34,23 +34,24 @@ def nearest_strike(ltp: float, interval: int = config.STRIKE_INTERVAL) -> int:
     return int(round(ltp / interval) * interval)
 
 
-def build_strike_window(ltp: float) -> list:
+def build_strike_window(ltp: float, interval: int = None) -> list:
     """
     Returns the list of strikes to watch: nearest strike +/- N
-    (N = STRIKES_EACH_SIDE).
+    (N = STRIKES_EACH_SIDE). `interval` is the index's strike spacing (default: Nifty's).
     e.g. ltp=24408 -> nearest=24400 -> [24300, 24350, 24400, 24450, 24500]
     """
-    center = nearest_strike(ltp)
+    interval = interval or config.STRIKE_INTERVAL
+    center = nearest_strike(ltp, interval)
     n = config.STRIKES_EACH_SIDE
-    return [center + (i * config.STRIKE_INTERVAL) for i in range(-n, n + 1)]
+    return [center + (i * interval) for i in range(-n, n + 1)]
 
 
-def current_weekly_expiry(client):
+def current_weekly_expiry(client, underlying_key: str = None):
     """
-    Fetches the nearest weekly expiry date for Nifty options.
+    Fetches the nearest expiry date for the index's options (default: Nifty).
     Returns a date string (e.g. '2026-07-10') or None on failure.
     """
-    expiries, err = client.fetch_option_expiries(config.NIFTY_OPTION_UNDERLYING_KEY)
+    expiries, err = client.fetch_option_expiries(underlying_key or config.NIFTY_OPTION_UNDERLYING_KEY)
     if err or not expiries:
         return None
     return expiries[0]  # ascending order -> nearest expiry first
@@ -83,18 +84,21 @@ def current_weekly_expiry_dates(client):
     return expiry_str, dates
 
 
-# expiry -> {strike: {"CE": instrument_key, "PE": instrument_key}}
+# (underlying, expiry) -> {strike: {"CE": instrument_key, "PE": instrument_key}}
 _option_key_cache: dict = {}
 
 
-def option_instrument_keys(client, expiry: str):
+def option_instrument_keys(client, expiry: str, underlying_key: str = None):
     """
     CE/PE instrument keys for every strike of the given expiry, fetched once and
-    cached. Returns ({strike: {"CE": key, "PE": key}}, None) or (None, error).
+    cached per index. Returns ({strike: {"CE": key, "PE": key}}, None) or (None, error).
+    `underlying_key` defaults to Nifty.
     """
-    if expiry in _option_key_cache:
-        return _option_key_cache[expiry], None
-    contracts, err = client.fetch_option_contracts(config.NIFTY_OPTION_UNDERLYING_KEY, expiry)
+    underlying_key = underlying_key or config.NIFTY_OPTION_UNDERLYING_KEY
+    cache_key = (underlying_key, expiry)
+    if cache_key in _option_key_cache:
+        return _option_key_cache[cache_key], None
+    contracts, err = client.fetch_option_contracts(underlying_key, expiry)
     if contracts is None:
         return None, err
     mapping: dict = {}
@@ -103,5 +107,5 @@ def option_instrument_keys(client, expiry: str):
         if strike is None or opt not in ("CE", "PE") or not ik:
             continue
         mapping.setdefault(int(strike), {})[opt] = ik
-    _option_key_cache[expiry] = mapping
+    _option_key_cache[cache_key] = mapping
     return mapping, None

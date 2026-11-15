@@ -10,18 +10,34 @@ import io
 import time
 from datetime import datetime
 
+import config
 import market_utils
 
 CALC_RETRY_SECONDS = 300
 
-# ---------------------------------------------------------------- uploaded CSV store
-_csv_bep: dict = {}            
-_csv_info: dict = {"loaded_at": None, "count": 0, "filename": ""}
+# ---------------------------------------------------------------- per-index stores
+# Every index (NIFTY, SENSEX) has its own uploaded BEP file and its own calculated fallbacks.
+_csv_by_index: dict = {}       # index -> {strike: bep}
+_info_by_index: dict = {}      # index -> {"loaded_at", "count", "filename"}
+_calc_strikes_by_index: dict = {}   # index -> strikes whose BEP was calculated (not from the file)
+
+def _csv_store(index: str) -> dict:
+    return _csv_by_index.setdefault(index, {})
+
+def _info_store(index: str) -> dict:
+    return _info_by_index.setdefault(index, {"loaded_at": None, "count": 0, "filename": ""})
+
+def csv_strikes(index: str = "NIFTY") -> set:
+    """Strikes present in the uploaded BEP file of this index."""
+    return set(_csv_store(index))
+
+# Nifty's stores, kept under the old names for any code that still reads them directly.
+_csv_bep = _csv_store("NIFTY")
+_csv_info = _info_store("NIFTY")
 
 # ---------------------------------------------------------------- calculated fallback store
 _calc_cache: dict = {}         
 _calc_fail: dict = {}          
-_calc_strikes: set = set()     
 
 def _norm(header: str) -> str:
     return "".join(ch for ch in (header or "").lower() if ch.isalnum())
@@ -32,8 +48,8 @@ def _num(value):
     except (TypeError, ValueError):
         return None
 
-def load_csv(data: bytes, filename: str = ""):
-    """Parses an uploaded BEP file and replaces the stored one."""
+def load_csv(data: bytes, filename: str = "", index: str = "NIFTY"):
+    """Parses an uploaded BEP file and replaces the one stored for this index."""
     text = data.decode("utf-8-sig", errors="replace")
     if not text.strip():
         return False, "The file is empty.", []
@@ -78,33 +94,37 @@ def load_csv(data: bytes, filename: str = ""):
     if not loaded:
         return False, "No usable rows found.", warnings
 
-    _csv_bep.clear()
-    _csv_bep.update(loaded)
-    _csv_info.update(loaded_at=datetime.now(market_utils.IST), count=len(loaded), filename=filename)
+    store, info = _csv_store(index), _info_store(index)
+    store.clear()
+    store.update(loaded)
+    info.update(loaded_at=datetime.now(market_utils.IST), count=len(loaded), filename=filename)
     msg = f"Loaded {len(loaded)} strikes ({min(loaded)} - {max(loaded)})"
     return True, msg, warnings
 
-def status_text() -> str:
-    if not _csv_info["loaded_at"]:
+def status_text(index: str = "NIFTY") -> str:
+    info = _info_store(index)
+    if not info["loaded_at"]:
         text = "BEP file: not uploaded (all BEPs calculated)"
     else:
-        loaded_at = _csv_info["loaded_at"]
-        text = f"BEP file: {_csv_info['count']} strikes loaded at {loaded_at.strftime('%d-%b %H:%M')}"
+        loaded_at = info["loaded_at"]
+        text = f"BEP file: {info['count']} strikes loaded at {loaded_at.strftime('%d-%b %H:%M')}"
         if loaded_at.date() != datetime.now(market_utils.IST).date():
             text += "  ⚠ NOT from today"
-    if _calc_strikes:
-        text += f" | calculated: {len(_calc_strikes)}"
+    calc = _calc_strikes_by_index.get(index)
+    if calc:
+        text += f" | calculated: {len(calc)}"
     return text
 
-def _calc_bep(client, expiry: str, strike: int):
+def _calc_bep(client, expiry: str, strike: int, index: str = "NIFTY"):
     today = datetime.now(market_utils.IST).strftime("%Y-%m-%d")
-    key = (expiry, strike, today)
+    key = (index, expiry, strike, today)
     if key in _calc_cache:
         return _calc_cache[key]
     if time.monotonic() - _calc_fail.get(key, -1e9) < CALC_RETRY_SECONDS:
         return None
 
-    mapping, _ = market_utils.option_instrument_keys(client, expiry)
+    underlying = config.INDEXES.get(index, {}).get("underlying_key")
+    mapping, _ = market_utils.option_instrument_keys(client, expiry, underlying)
     legs = (mapping or {}).get(strike, {})
     ce_ik, pe_ik = legs.get("CE"), legs.get("PE")
     ce_pdc = pe_pdc = None
@@ -119,12 +139,13 @@ def _calc_bep(client, expiry: str, strike: int):
     _calc_cache[key] = bep
     return bep
 
-def get_bep(client, expiry: str, strike: int):
+def get_bep(client, expiry: str, strike: int, index: str = "NIFTY"):
     strike = int(strike)
-    if strike in _csv_bep:
-        return _csv_bep[strike], "csv"
-    calc = _calc_bep(client, expiry, strike)
+    store = _csv_store(index)
+    if strike in store:
+        return store[strike], "csv"
+    calc = _calc_bep(client, expiry, strike, index)
     if calc is not None:
-        _calc_strikes.add(strike)
+        _calc_strikes_by_index.setdefault(index, set()).add(strike)
         return calc, "calc"
     return None, None

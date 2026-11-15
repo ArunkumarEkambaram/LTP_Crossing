@@ -31,6 +31,7 @@ class PendingTrack:
     expiry: str
     bucket_start: datetime   # IST-aware start of the match candle
     bucket_end: datetime     # IST-aware end of the match candle (when we can read it)
+    underlying_key: str = None   # option underlying of the index (None = Nifty)
 
 
 def bucket_bounds(t: datetime):
@@ -92,7 +93,7 @@ def process_pending(client, pending: list, now: datetime) -> list:
         if now < track.bucket_end + delay:
             continue
 
-        mapping, _ = market_utils.option_instrument_keys(client, track.expiry)
+        mapping, _ = market_utils.option_instrument_keys(client, track.expiry, track.underlying_key)
         mapping = mapping or {}
         ce_ik = mapping.get(track.ce_strike, {}).get("CE")
         pe_ik = mapping.get(track.pe_strike, {}).get("PE")
