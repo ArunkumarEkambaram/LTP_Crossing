@@ -3,9 +3,9 @@ replay.py - "Replay a past day" for the CE = PE (LTP Crossing) scanner.
 
 Runs the LIVE scanner code (scanner.run_scan_cycle + StateManager + tracker) over one past trading day, minute by
 minute, using Upstox historical candles instead of live quotes:
-  - every 1-minute candle is one scan: the index close of that minute is the index LTP. If it is near a strike
-    (strike - near_band < LTP <= strike + near_band) that strike's CE / PE "LTP" is its 1-minute close (the last
-    traded close is carried forward if a leg did not trade in that minute); between bands nothing is checked;
+  - every 1-minute candle is one scan: the index close of that minute is the index LTP and re-centres the window
+    (nearest strike +/- STRIKES_EACH_SIDE); each window strike's CE / PE "LTP" is its 1-minute close (the last
+    traded close is carried forward if a leg did not trade in that minute);
   - the 5-minute cooldown after a match hides further matches, exactly like live;
   - every match is then judged on its 5-minute candle by tracker.py ("Closed Above", Valid / Invalid).
 No toasts, no browser notifications. The live scanner is untouched and keeps running.
@@ -20,7 +20,6 @@ from datetime import datetime, timedelta
 
 import config
 import market_utils
-import match_logic
 import scanner
 import tracker
 from state_manager import StateManager
@@ -123,7 +122,7 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
 
     rc = ReplayClient(client, date_str, expiry, cfg["underlying_key"])
     sm = StateManager(name)
-    found, strikes_seen, near_scans = [], set(), 0
+    found, strikes_seen = [], set()
     for c in index_candles:
         label = c[0][:16]
         rc.set_minute(label)
@@ -133,10 +132,7 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
                                          index_ltp=float(c[4]), now=now)
         for e in summary["errors"]:
             rc.errors.append(f"{label[11:]} {e}")
-        near = match_logic.near_strike(float(c[4]), cfg["strike_interval"], cfg.get("near_band", 10))
-        if near is not None:                   # counted here: the scan skips this step while in cooldown
-            strikes_seen.add(near)
-            near_scans += 1
+        strikes_seen.update(summary.get("window") or [])
         for m in summary["matches"]:
             found.append((label, m, float(c[4])))
 
@@ -161,7 +157,7 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
     out["rows"] = rows
     out["strikes"] = sorted(strikes_seen)
     out["info"] = (f"REPLAY {name} {day:%a %d %b %Y} · expiry {expiry} · {len(index_candles)} one-minute scans · "
-                   f"near a strike (± {cfg.get('near_band', 10)}) in {near_scans} of them · "
+                   f"strikes checked: nearest ± {config.STRIKES_EACH_SIDE} · "
                    f"{len(rows)} match(es): {valid} valid, {len(rows) - valid} invalid / no data"
                    + (f" · {len(rc.errors)} data error(s), see log" if rc.errors else ""))
     return out

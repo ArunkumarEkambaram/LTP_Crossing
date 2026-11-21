@@ -23,7 +23,7 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True,
     "matches" is a list of MatchEvent (empty list if none found this cycle).
     `now` defaults to the current time; replay.py passes the simulated time of a past day.
     """
-    summary = {"nifty_ltp": None, "index_ltp": None, "window": None, "near_strike": None, "quotes": {}, "matches": [], "errors": []}
+    summary = {"nifty_ltp": None, "index_ltp": None, "window": None, "quotes": {}, "matches": [], "errors": []}
     cfg = config.INDEXES[index]
     now = now or datetime.now()
 
@@ -67,20 +67,16 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True,
         summary["cooldown_remaining"] = state_mgr.cooldown_remaining_seconds
         return summary
 
-    # 3. Only while the index is near a strike: fetch that strike's CE / PE LTP
-    near = match_logic.near_strike(nifty_ltp, cfg["strike_interval"], cfg.get("near_band", 10))
-    summary["near_strike"] = near
-    if near is None:
-        return summary
+    # 3. Fetch CE/PE LTPs for the window's strikes
     quotes, err = client.fetch_ce_pe_ltp_for_strikes(
-        cfg["underlying_key"], window.expiry_date, [near]
+        cfg["underlying_key"], window.expiry_date, window.strikes
     )
     if quotes is None:
         summary["errors"].append(f"Option chain fetch failed: {err}")
         return summary
     summary["quotes"] = quotes
 
-    # 4. CE = PE at the near strike
+    # 4. CE = PE at the same strike, for each strike of the window
     raw_matches = match_logic.find_matches(quotes)
     if raw_matches:
         events = [
