@@ -137,11 +137,35 @@ BEP_EXPORT_COLUMNS = [
 SUPPORT_GREEN = ("rgb(200,230,201)", "#1b3d1e")
 SUPPORT_RED = ("rgb(255,205,210)", "#7f1d1d")
 
+LOG_SHOW_LINES = 20       # lines visible in the log panel
+LOG_KEEP_LINES = 200      # lines kept in memory
+LOG_DEDUPE_LOOKBACK = 20  # a message repeating within this many recent lines is merged, not re-added
+
+
+def _log_body(line: str) -> str:
+    """Message text without the leading "[HH:MM:SS] " stamp."""
+    if line.startswith("[") and "] " in line[:12]:
+        return line.split("] ", 1)[1]
+    return line
+
+
 def log(msg: str):
-    log_lines.append(msg)
-    del log_lines[:-200]
+    # Repeated messages (e.g. the same error every scan) are merged into one line with a "(xN)" counter
+    # and the latest timestamp, instead of flooding the panel.
+    body = _log_body(msg)
+    for i in range(len(log_lines) - 1, max(-1, len(log_lines) - 1 - LOG_DEDUPE_LOOKBACK), -1):
+        if log_lines[i]["body"] == body:
+            entry = log_lines.pop(i)
+            entry["count"] += 1
+            entry["text"] = msg
+            log_lines.append(entry)
+            break
+    else:
+        log_lines.append({"body": body, "text": msg, "count": 1})
+    del log_lines[:-LOG_KEEP_LINES]
     if log_area is not None:
-        log_area.set_content("\n".join(log_lines[-40:]))
+        log_area.set_content("\n".join(
+            e["text"] + (f" (x{e['count']})" if e["count"] > 1 else "") for e in log_lines[-LOG_SHOW_LINES:]))
 
 def fetch_index_ltps(names):
     """Spot LTP of each index in `names` (one API call). Returns ({name: ltp}, error or None)."""
