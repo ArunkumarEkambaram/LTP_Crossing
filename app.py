@@ -41,7 +41,9 @@ LIVE_MATCH_COLUMNS = [
     {"name": "pe_strike", "label": "PE Strike", "field": "pe_strike"},
     {"name": "price", "label": "Rounded Price", "field": "price"},
     {"name": "check_till", "label": "Checked Till", "field": "check_till"},
-    {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
+    {"name": "closed_above", "label": "Breakout", "field": "closed_above"},
+    {"name": "best", "label": "Best move", "field": "best"},
+    {"name": "result", "label": "Result", "field": "result"},
 ]
 LIVE_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in LIVE_MATCH_COLUMNS]
 
@@ -54,7 +56,8 @@ REPLAY_COLUMNS = [
     {"name": "price", "label": "Rounded Price", "field": "price"},
     {"name": "index_ltp", "label": "Index LTP", "field": "index_ltp"},
     {"name": "check_till", "label": "Checked Till", "field": "check_till"},
-    {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
+    {"name": "closed_above", "label": "Breakout", "field": "closed_above"},
+    {"name": "best", "label": "Best move", "field": "best"},
     {"name": "result", "label": "Result", "field": "result"},
 ]
 REPLAY_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in REPLAY_COLUMNS]
@@ -277,7 +280,8 @@ def main_page():
                     matches_col = ui.column().classes("w-full gap-2")
                     with matches_col:
                         matches_table = ui.table(columns=LIVE_MATCH_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
-                        INVALID_CLASS = "props.row.state === 'invalid' ? 'bg-red-1' : ''"
+                        INVALID_CLASS = ("props.row.state === 'valid' ? 'bg-green-1' : "
+                                         "(['invalid', 'failed', 'nodata'].includes(props.row.state) ? 'bg-red-1' : '')")
                         for col in LIVE_MATCH_COLUMNS:
                             matches_table.add_slot(
                                 f"body-cell-{col['name']}",
@@ -317,7 +321,8 @@ def main_page():
                             new_rows.append({
                                 "id": row_id, "time": m.triggered_at.strftime("%H:%M:%S"),
                                 "ce_strike": m.ce_strike, "pe_strike": m.pe_strike, "price": m.price,
-                                "check_till": bucket_end.strftime("%H:%M"), "closed_above": "Tracking...", "state": "tracking",
+                                "check_till": tracker.watch_end(bucket_start).strftime("%H:%M"), "closed_above": "None yet",
+                                "best": "", "result": f"WATCHING 0/{tracker.watch_candles()}", "state": "watching",
                             })
                             if expiry:
                                 pending_tracks.append(tracker.PendingTrack(
@@ -339,7 +344,8 @@ def main_page():
                                     row.update(fields)
                                     break
                             if final:
-                                log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} match #{row_id} result: {fields.get('result')} ({fields.get('closed_above', '')})")
+                                log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} match #{row_id} result: {fields.get('result')} "
+                                    f"(breakout {fields.get('closed_above', '')}, best {fields.get('best') or '-'})")
                         matches_table.update()
 
                 section.set_visibility(config.INDEXES[name]["enabled"])
@@ -480,7 +486,7 @@ def main_page():
         with ui.tab_panel(replay_tab):
             ui.label("Replay a past day: runs the live CE = PE scanner minute by minute on Upstox historical candles "
                      "(each strike's own CE vs PE, nearest ± N strikes from the side panel; 5-minute cooldown after a match; "
-                     "each match judged on its 5-minute candle). No alerts; the live scan keeps running. "
+                     "each match watched for 6 five-minute candles: breakout then hold). No alerts; the live scan keeps running. "
                      "Only days of the current weekly expiry can be replayed (older contracts have expired).") \
                 .classes("text-sm text-gray-600")
 
@@ -493,7 +499,8 @@ def main_page():
             rp_info = ui.label("").classes("font-bold")
 
             rp_table = ui.table(columns=REPLAY_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
-            rp_row_class = "props.row.state === 'valid' ? 'bg-green-1' : (props.row.state ? 'bg-red-1' : '')"
+            rp_row_class = ("props.row.state === 'valid' ? 'bg-green-1' : "
+                            "(['invalid', 'failed', 'nodata'].includes(props.row.state) ? 'bg-red-1' : '')")
             for col in REPLAY_COLUMNS:
                 rp_table.add_slot(
                     f"body-cell-{col['name']}",

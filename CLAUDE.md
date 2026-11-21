@@ -34,9 +34,17 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
   `MARKET_CLOSE` 15:40 IST, weekdays, not `MARKET_HOLIDAYS`).
 - **Cooldown:** after a match the window freezes and further matches are hidden for `COOLDOWN_SECONDS` (5 min). All
   matches found in the same scan are recorded.
-- **Follow-up check** (`tracker.py`): each match is judged on the 5-minute candle (09:15 grid) that contains it. For each
-  leg: above = close > rounded price, red = open > close. Any leg closing above in a RED candle → Invalid; else a leg
-  closing above in a green candle → Valid; else Invalid. Candle missing after `TRACK_GIVE_UP_SECONDS` → "No data".
+- **Follow-up check** (`tracker.py`, PR #6, "wait for 6 candles like BEP-AlgoDelta"): each match is watched for
+  `TRACK_WATCH_CANDLES` = 6 five-minute candles (09:15 grid): the match candle + the next 5 (match 09:26 → 09:25 …
+  09:50, result after 09:55 = "Checked Till"). Row shows `WATCHING n/6` meanwhile. Rule "breakout then hold":
+  - above = close > P, red = open > close (flat = green).
+  - First candle where a leg closes above P: in a RED candle → **Invalid (red)**, done; in a GREEN candle → that leg is
+    the breakout leg (both green above: the one further above P).
+  - Then the breakout leg closing below P → **Failed · hh:mm**, done.
+  - After the 6th candle: breakout held → **Valid**; no breakout → **None**; every candle missing → **No data**.
+  - **Best move** = breakout leg's highest high − P over the watched candles. Columns: Breakout, Best move, Result.
+  - A candle still missing `TRACK_GIVE_UP_SECONDS` after it closed is skipped (still counted).
+  - Colours: Valid green; Invalid / Failed / None / No data red; WATCHING plain.
 - **Alerts** (`notifier.py`): on-screen toast + browser notification per match, only if `MATCH_ALERTS_ENABLED` (True)
   and not paused (Pause alerts button, `ALERTS_PAUSED`). No Telegram.
 
@@ -51,7 +59,7 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - `scanner.py`: `run_scan_cycle(client, state_mgr, ..., now=None)`, one scan of one index. `now` is used by replay.
 - `state_manager.py`: window re-centring, freeze / cooldown (one `StateManager` per index).
 - `match_logic.py`: the match rule. `models.py`: `StrikeWindow`, `MatchEvent`, `ScanState`.
-- `tracker.py`: the 5-minute follow-up check.
+- `tracker.py`: the 6-candle follow-up watch (breakout then hold).
 - `replay.py`: **Replay a past day** (see below).
 - `backtest.py`: Backtest tab, NIFTY only. Lists every raw same-strike crossing on 1-minute closes over each minute's
   window (same rule as live), **cooldown ignored**.
@@ -66,10 +74,10 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
   running.
 - `ReplayClient` wraps the Upstox client for one day, and the **live code** runs on it, one scan per 1-minute candle
   09:15–15:29: index close = LTP (re-centres the window), each window strike's 1-minute CE / PE closes = LTPs (last close
-  carried forward if it didn't trade that minute), same cooldown, then `tracker.process_pending` on that day's
-  5-minute candles. Keep replay going through the live code so the two never drift apart.
-- Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Index LTP, Checked Till, Closed Above, Result (green = Valid,
-  red = Invalid / No data). CSV/XLSX download.
+  carried forward if it didn't trade that minute), same cooldown, then `tracker.process_pending` (6-candle watch) on
+  that day's 5-minute candles (today: only closed candles, so late matches stay WATCHING). Keep replay going through the live code so the two never drift apart.
+- Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Index LTP, Checked Till, Breakout, Best move, Result.
+  CSV/XLSX download.
 - Limits: only days of the current weekly expiry (older contracts' keys are no longer listed by Upstox); one price per
   minute, so a crossing lasting only seconds inside a minute is missed (live scans every 10 s).
 

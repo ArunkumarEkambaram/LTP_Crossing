@@ -1,17 +1,21 @@
 """
-tracker.py — follow-up check after a confirmed CE/PE match (live scanner only).
+tracker.py — follow-up check after a CE = PE match (live scanner and replay).
 
-Candles are 5-MINUTE chart candles on the 9:15 grid (9:15-9:20, 9:20-9:25 ...).
-The match is judged on the candle containing the match time: a match at 09:31
-uses the 09:30-09:35 candle; a match at exactly 09:35:00 uses 09:35-09:40.
-No further candles are checked.
+Candles are 5-MINUTE chart candles on the 9:15 grid (9:15-9:20, 9:20-9:25 ...). The match is watched for
+config.TRACK_WATCH_CANDLES = 6 candles: the candle containing the match time plus the next 5 (a match at 09:26
+watches 09:25, 09:30 ... 09:50; the result is known after 09:55). Meanwhile the row shows "WATCHING n/6".
 
-For each leg (CE, PE):   above = close > P      red = open > close
-(a candle that is not red — green or flat — counts as green)
+For each leg (CE, PE):   above = close > P      red = open > close (a flat candle counts as green)
 
-  - any leg closed above P in a RED candle        -> INVALID
-  - else a leg closed above P in a GREEN candle   -> VALID
-  - else (neither leg closed above P)             -> INVALID
+  1. Breakout: the first candle in which a leg closes above P.
+       - closed above P in a RED candle (either leg)  -> INVALID (red breakout), done
+       - closed above P in a GREEN candle             -> that leg is the BREAKOUT leg
+         (both legs green above P: the one further above P)
+  2. Hold: from the next candle on, the breakout leg closing below P -> FAILED · hh:mm, done
+  3. After the 6th candle: breakout held -> VALID;  no breakout at all -> NONE.
+Best move = the breakout leg's highest high minus P over the watched candles.
+A candle still missing TRACK_GIVE_UP_SECONDS after it closed is skipped (still counted); if every candle
+was missing the row reads "No data".
 """
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -22,6 +26,10 @@ import market_utils
 CANDLE_MINUTES = 5
 
 
+def watch_candles() -> int:
+    return int(getattr(config, "TRACK_WATCH_CANDLES", 6))
+
+
 @dataclass
 class PendingTrack:
     row_id: int              # id of the table row to fill in
@@ -30,8 +38,13 @@ class PendingTrack:
     price: int               # the rounded value P
     expiry: str
     bucket_start: datetime   # IST-aware start of the match candle
-    bucket_end: datetime     # IST-aware end of the match candle (when we can read it)
+    bucket_end: datetime     # IST-aware end of the match candle
     underlying_key: str = None   # option underlying of the index (None = Nifty)
+    n: int = 0               # watched candles processed so far
+    seen: int = 0            # of those, how many had data
+    leg: str = None          # breakout leg "CE" / "PE" once it happened
+    leg_time: str = ""       # hh:mm of the breakout candle
+    best: float = None       # breakout leg: highest high - P
 
 
 def bucket_bounds(t: datetime):
@@ -39,6 +52,11 @@ def bucket_bounds(t: datetime):
     boundary (e.g. 09:35:00) belongs to the candle that STARTS there."""
     start = t.replace(minute=t.minute - t.minute % CANDLE_MINUTES, second=0, microsecond=0)
     return start, start + timedelta(minutes=CANDLE_MINUTES)
+
+
+def watch_end(bucket_start: datetime) -> datetime:
+    """When the last watched candle closes."""
+    return bucket_start + timedelta(minutes=CANDLE_MINUTES * watch_candles())
 
 
 def _candle_for_bucket(client, instrument_key: str, bucket_start: datetime, cache: dict):
@@ -53,63 +71,89 @@ def _candle_for_bucket(client, instrument_key: str, bucket_start: datetime, cach
     return None
 
 
-def evaluate(ce_candle, pe_candle, price: int) -> dict:
-    """Judge the match candle. Returns the table fields (closed_above, touched,
-    result, state)."""
-    legs = {}
-    for name, c in (("CE", ce_candle), ("PE", pe_candle)):
-        o, h, l, cl = c[1], c[2], c[3], c[4]
-        legs[name] = {"above": cl > price, "red": o > cl, "touched": l <= price <= h}
+def _fields(t: PendingTrack, result: str, state: str) -> dict:
+    if t.leg:
+        above = f"{t.leg} (green) {t.leg_time}"
+    elif t.leg_time:                       # red breakout: leg_time holds "CE (red) hh:mm"
+        above = t.leg_time
+    else:
+        above = "None yet" if state == "watching" else "None"
+    return {"closed_above": above, "result": result, "state": state,
+            "best": f"{t.best:+.2f}" if t.best is not None else ""}
 
-    above = [n for n in ("CE", "PE") if legs[n]["above"]]
-    red_above = [n for n in above if legs[n]["red"]]
-    green_above = [n for n in above if not legs[n]["red"]]
-    closed_above = " + ".join(f"{n} ({'red' if legs[n]['red'] else 'green'})" for n in above) or "None"
 
-    ce_t, pe_t = legs["CE"]["touched"], legs["PE"]["touched"]
-    touched = "Both" if ce_t and pe_t else "CE only" if ce_t else "PE only" if pe_t else "Neither"
-
-    valid = bool(green_above) and not red_above
-    return {"closed_above": closed_above, "touched": touched,
-            "result": "Valid" if valid else "Invalid",
-            "state": "valid" if valid else "invalid"}
+def step(t: PendingTrack, ce_c, pe_c, label: str):
+    """Applies one watched candle (either may be None = no data). Returns (result, state) when the
+    track is decided by this candle, else None."""
+    p = t.price
+    if ce_c or pe_c:
+        t.seen += 1
+    if t.leg is None:
+        legs = {}
+        for name, c in (("CE", ce_c), ("PE", pe_c)):
+            if c:
+                o, h, cl = float(c[1]), float(c[2]), float(c[4])
+                legs[name] = {"above": cl > p, "red": o > cl, "dist": cl - p, "high": h}
+        above = [n for n in legs if legs[n]["above"]]
+        if any(legs[n]["red"] for n in above):
+            reds = " + ".join(n for n in above if legs[n]["red"])
+            t.leg_time = f"{reds} (red) {label}"
+            return "Invalid (red)", "invalid"
+        if above:
+            t.leg = max(above, key=lambda n: legs[n]["dist"])
+            t.leg_time = label
+            t.best = round(legs[t.leg]["high"] - p, 2)
+        return None
+    c = ce_c if t.leg == "CE" else pe_c
+    if c:
+        t.best = max(t.best, round(float(c[2]) - p, 2))
+        if float(c[4]) < p:
+            return f"Failed · {label}", "failed"
+    return None
 
 
 def process_pending(client, pending: list, now: datetime) -> list:
     """
-    Judges every pending match whose candle has closed (plus a short delay so
-    Upstox has the finished candle). Judged matches are REMOVED from `pending`.
-    Returns [(row_id, fields_to_update, True), ...] — the third item is always
-    True now (every match is settled by a single candle).
-    If the candle is still missing after TRACK_GIVE_UP_SECONDS the row is marked
-    "No data" (e.g. an option that didn't trade in that candle).
+    Applies every watched candle that has closed (plus TRACK_FINALIZE_DELAY_SECONDS so Upstox has it).
+    Returns [(row_id, fields_to_update, final), ...]; final tracks are REMOVED from `pending`.
+    While watching, fields["result"] = "WATCHING n/6".
     """
     updates = []
     cache: dict = {}
     delay = timedelta(seconds=config.TRACK_FINALIZE_DELAY_SECONDS)
     give_up = timedelta(seconds=config.TRACK_GIVE_UP_SECONDS)
+    n_max = watch_candles()
+    step_td = timedelta(minutes=CANDLE_MINUTES)
 
-    for track in list(pending):
-        if now < track.bucket_end + delay:
-            continue
-
-        mapping, _ = market_utils.option_instrument_keys(client, track.expiry, track.underlying_key)
-        mapping = mapping or {}
-        ce_ik = mapping.get(track.ce_strike, {}).get("CE")
-        pe_ik = mapping.get(track.pe_strike, {}).get("PE")
-        ce_c = _candle_for_bucket(client, ce_ik, track.bucket_start, cache) if ce_ik else None
-        pe_c = _candle_for_bucket(client, pe_ik, track.bucket_start, cache) if pe_ik else None
-
-        if not (ce_c and pe_c):
-            if now >= track.bucket_end + give_up:
-                pending.remove(track)
-                updates.append((track.row_id, {"closed_above": "No data", "touched": "No data",
-                                               "result": "No data", "state": "nodata"}, True))
-            continue  # otherwise: candle not available yet, retry on the next scan
-
-        fields = {"check_till": track.bucket_end.strftime("%H:%M")}
-        fields.update(evaluate(ce_c, pe_c, track.price))
-
-        pending.remove(track)
-        updates.append((track.row_id, fields, True))
+    for t in list(pending):
+        changed, final = False, None
+        while t.n < n_max and final is None:
+            c_start = t.bucket_start + step_td * t.n
+            c_end = c_start + step_td
+            if now < c_end + delay:
+                break                                  # this candle hasn't closed yet
+            mapping, _ = market_utils.option_instrument_keys(client, t.expiry, t.underlying_key)
+            mapping = mapping or {}
+            ce_ik = mapping.get(t.ce_strike, {}).get("CE")
+            pe_ik = mapping.get(t.pe_strike, {}).get("PE")
+            ce_c = _candle_for_bucket(client, ce_ik, c_start, cache) if ce_ik else None
+            pe_c = _candle_for_bucket(client, pe_ik, c_start, cache) if pe_ik else None
+            need = (ce_c and pe_c) if t.leg is None else (ce_c if t.leg == "CE" else pe_c)
+            if not need and now < c_end + give_up:
+                break                                  # not available yet: retry on the next scan
+            final = step(t, ce_c, pe_c, c_start.strftime("%H:%M"))
+            t.n += 1
+            changed = True
+        if final is None and t.n >= n_max:
+            if t.seen == 0:
+                final = ("No data", "nodata")
+            elif t.leg:
+                final = ("Valid", "valid")
+            else:
+                final = ("None", "invalid")
+        if final:
+            pending.remove(t)
+            updates.append((t.row_id, _fields(t, *final), True))
+        elif changed:
+            updates.append((t.row_id, _fields(t, f"WATCHING {t.n}/{n_max}", "watching"), False))
     return updates
