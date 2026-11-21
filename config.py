@@ -49,4 +49,4 @@ COOLDOWN_SECONDS = 5 * 60         # freeze the window + suppress further matches
 COOLDOWN_GRACE_SECONDS = 0        # optional early-unfreeze tolerance (not needed at this scan rate)
 # CE = PE alerts (toast, browser). False = matches still appear in the table and are followed
 # up, but no notification is sent.
-MATCH_ALERTS_ENABLED = False
+MATCH_ALERTS_ENABLED = True
