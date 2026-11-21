@@ -12,9 +12,9 @@ NIFTY_OPTION_UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 # checkboxes in the top bar (changed at runtime from the UI). A disabled index is not polled at all.
 INDEXES = {
     "NIFTY":  {"index_key": "NSE_INDEX|Nifty 50", "underlying_key": "NSE_INDEX|Nifty 50",
-               "strike_interval": 50,  "enabled": True},
+               "strike_interval": 50,  "enabled": True,  "ce_pe": True},
     "SENSEX": {"index_key": "BSE_INDEX|SENSEX",   "underlying_key": "BSE_INDEX|SENSEX",
-               "strike_interval": 100, "enabled": False},
+               "strike_interval": 100, "enabled": False, "ce_pe": True},
 }
 
 STRIKE_INTERVAL = 50        # Nifty strike spacing (used by the Nifty-only backtest)
@@ -59,10 +59,91 @@ SUPPORT_SCAN_ALL_CSV_STRIKES = True
 SUPPORT_FAIL_WINDOW_CANDLES = 3
 
 # ---------------------------------------------------------------- CE = PE (LTP crossing)
-# Master switch = the "CE = PE" checkbox in the top bar (default on). It applies to every enabled index.
-CE_PE_ENABLED = True
+# CE = PE is switched on/off per index with the checkbox under that index's BEP Support boards (INDEXES[..]["ce_pe"]).
 COOLDOWN_SECONDS = 5 * 60         # freeze the window + suppress further matches for 5 min after a match
 COOLDOWN_GRACE_SECONDS = 0        # optional early-unfreeze tolerance (not needed at this scan rate)
 # CE = PE alerts (toast, browser, Telegram). False = matches still appear in the table and are followed
 # up, but no notification is sent. BEP Support alerts are separate and unaffected.
 MATCH_ALERTS_ENABLED = False
+
+# ---------------------------------------------------------------- AUTO ORDER (AlgoDelta JSON Bridge)
+# One order is sent for EVERY star support: the first support of the day for a strike on a leg (the star on the board).
+#   * 09:15 candle: the moment a strike's still-forming candle has touched BEP (low <= BEP) and its live LTP is above
+#     BEP while the candle is green (LTP > open) - immediately, without waiting for the candle to close.
+#   * later candles: entered from the next candle (see max_dist / limit_offset below).
+# Each (day, index, CE/PE, strike) is ordered at most once, also across a Rescan or a restart of the page.
+# Replayed history (Rescan, CSV upload, late start) never orders.
+AUTO_ORDER_ENABLED = False        # "Auto order" checkbox. Always off when the app starts.
+AUTO_ORDER_DRY_RUN = True         # "Dry run" checkbox. True = log the JSON only, send nothing.
+AUTO_ORDER_PAUSED = False         # "Pause algo trade" button: no NEW entry orders while True (open limit orders are still
+                                  # cancelled on red / expiry). Stars seen while paused are skipped, never queued for later.
+AUTO_ORDER_DAILY_LIMIT = 20       # "Max orders/day" box: hard cap on LIVE orders per day, all indices together
+
+# Per-index AlgoDelta settings. Edit them under each index's BEP Support boards (webhook, JSON, Target, SL, Quantity,
+# distance and limit offset) or set the starting values here. The webhook URL is a secret: keep it out of shared files.
+#   webhook_url   AlgoDelta "Copy Webhook" URL         tgt / sl     Target / SL in points  ({tgt} {sl})
+#   qty           quantity ({qty}), default 1           confirmed    the "I checked this JSON" box - live orders stay
+#                                                                   blocked until it is ticked and saved
+#   max_dist      support candle close may be at most this many points above BEP for a MARKET entry (default 8)
+#   limit_offset  farther than that -> a LIMIT buy at BEP + this many points ({limit_price}), default 5
+# Stars after 09:15 are entered from the next candle: market entry if (close - BEP) <= max_dist, otherwise a limit order
+# at BEP + limit_offset. An unfilled limit order is cancelled at once when its support turns red, or when the 3-candle
+# window (SUPPORT_FAIL_WINDOW_CANDLES) ends. The 09:15 candle keeps its immediate market entry.
+# Three templates (AlgoDelta Syntax Generator JSON): strategy_order = market entry, limit_order, cancel_order.
+# Placeholders: {symbol} e.g. NIFTY17NOV2625400CE (index + expiry DDMMMYY + strike + CE/PE), {opt}, {signal} (UP for CE,
+# DOWN for PE), {qty} {tgt} {sl} {limit_price} {strike} {expiry} {index} {bep} {ltp}. A value that is exactly "{qty}",
+# "{tgt}", "{sl}", "{limit_price}" or "{strike}" is sent as a number. Anything else in { } is left untouched
+# (so "{{strategy.position_size}}" is sent exactly as written).
+import copy as _copy
+
+_STRATEGY_ORDER = {
+    "type": "strategy_order",
+    "exit_on_opposite": True,
+    "is_tgt": True,
+    "is_sl": True,
+    "is_trail_set": False,
+    "position_size": "{{strategy.position_size}}",
+    "transaction_type": "BUY",
+    "script_type": "{opt}",
+    "is_rollover": False,
+    "option_selection": "SYMBOL_BASED",
+    "script": "{symbol}",
+    "product": "INTRADAY",
+    "quantity": "{qty}",
+    "signal_type": "{signal}",
+    "tgt_type": "POINT",
+    "tgt_value": "{tgt}",
+    "sl_type": "POINT",
+    "sl_value": "{sl}",
+}
+
+_LIMIT_ORDER = {
+    "type": "limit_order",
+    "script_type": "{opt}",
+    "script": "{symbol}",
+    "product": "INTRADAY",
+    "quantity": "{qty}",
+    "price": "{limit_price}",
+    "transaction_type": "BUY",
+}
+
+_CANCEL_ORDER = {
+    "type": "cancel_order",
+    "script_type": "{opt}",
+    "script": "{symbol}",
+    "product": "INTRADAY",
+}
+
+
+def _default_auto_order() -> dict:
+    return {
+        "webhook_url": "", "confirmed": False,
+        "tgt": 30, "sl": 12, "qty": 1,
+        "max_dist": 8, "limit_offset": 5,
+        "templates": {"strategy_order": _copy.deepcopy(_STRATEGY_ORDER),
+                      "limit_order": _copy.deepcopy(_LIMIT_ORDER),
+                      "cancel_order": _copy.deepcopy(_CANCEL_ORDER)},
+    }
+
+
+AUTO_ORDER = {name: _default_auto_order() for name in INDEXES}

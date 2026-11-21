@@ -4,9 +4,13 @@ app.py — NiceGUI entry point for the BEP Support monitor.
 from datetime import datetime
 from nicegui import ui, run
 
+import csv
+import json
+import os
 import config
 import upstox_client
 import notifier
+import order_bridge
 import telegram_bot
 import market_utils
 import backtest
@@ -72,6 +76,56 @@ def make_comment_sync_handler(table):
                 row["comment"] = updated_row.get("comment", "")
                 break
     return handler
+
+
+ORDER_TYPES = {"Market entry (Strategy Order)": "strategy_order", "Limit entry (Limit Order)": "limit_order", "Cancel Order": "cancel_order"}
+TYPE_LABEL = {v: k for k, v in ORDER_TYPES.items()}
+SAMPLE_STRIKE = {"NIFTY": 25400, "SENSEX": 85000}      # only for the Preview JSON button
+
+ORDER_COLUMNS = [
+    {"name": "time", "label": "Time", "field": "time", "align": "left"},
+    {"name": "index", "label": "Index", "field": "index", "align": "left"},
+    {"name": "opt", "label": "Type", "field": "opt", "align": "left"},
+    {"name": "strike", "label": "Strike", "field": "strike", "align": "left"},
+    {"name": "kind", "label": "Order", "field": "kind", "align": "left"},
+    {"name": "bep", "label": "BEP", "field": "bep", "align": "left"},
+    {"name": "ltp", "label": "LTP", "field": "ltp", "align": "left"},
+    {"name": "limit_price", "label": "Limit price", "field": "limit_price", "align": "left"},
+    {"name": "status", "label": "Status", "field": "status", "align": "left"},
+    {"name": "detail", "label": "Detail", "field": "detail", "align": "left"},
+    {"name": "payload", "label": "JSON", "field": "payload", "align": "left"},
+]
+ORDER_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in ORDER_COLUMNS]
+ORDER_KIND = {"opening": "Opening candle (market)", "star": "Market entry", "limit": "Limit buy", "cancel": "Cancel limit"}
+ORDER_STATUS = {"dry_run": "DRY RUN", "sent": "SENT", "failed": "FAILED", "blocked": "BLOCKED"}
+
+
+def _orders_file() -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), f"orders_{datetime.now().strftime('%Y-%m-%d')}.csv")
+
+
+def _load_orders_today() -> list:
+    try:
+        with open(_orders_file(), newline="", encoding="utf-8") as f:
+            return [dict(r) for r in csv.DictReader(f)]
+    except OSError:
+        return []
+
+
+order_log = _load_orders_today()        # today's orders (dry run + live), shared by every page and kept in the CSV file
+
+
+def _save_order_row(row: dict):
+    try:
+        path = _orders_file()
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=[c["name"] for c in ORDER_COLUMNS])
+            if new:
+                w.writeheader()
+            w.writerow({k: row.get(k, "") for k in [c["name"] for c in ORDER_COLUMNS]})
+    except OSError:
+        pass
 
 
 BEP_EXPORT_COLUMNS = [
@@ -298,14 +352,65 @@ def main_page():
         for _idx, _cfg in config.INDEXES.items():
             ui.checkbox(_idx, value=_cfg["enabled"], on_change=lambda ev, n=_idx: on_index_toggle(n, ev.value))
 
-        def on_ce_pe_toggle(enabled):
-            config.CE_PE_ENABLED = bool(enabled)
-            for p in panels.values():
-                p["matches_col"].set_visibility(bool(enabled))
-            log(f"[{datetime.now().strftime('%H:%M:%S')}] CE = PE scanning {'ENABLED' if enabled else 'DISABLED'}")
+        # ---- auto order (AlgoDelta JSON Bridge): one order per star support. OFF at start, dry run ON at start
+        auto_badge = ui.badge("").props("color=orange")
 
-        ui.checkbox("CE = PE", value=config.CE_PE_ENABLED, on_change=lambda ev: on_ce_pe_toggle(ev.value)) \
-            .tooltip("CE = PE (LTP crossing) scanner and table, for every ticked index")
+        def apply_auto_state():
+            paused = config.AUTO_ORDER_PAUSED
+            algo_pause_btn.set_text("Resume algo trade" if paused else "Pause algo trade")
+            algo_pause_btn.props("icon=play_arrow color=green" if paused else "icon=pause color=orange")
+            if not config.AUTO_ORDER_ENABLED:
+                auto_badge.set_visibility(False)
+                return
+            if paused:
+                auto_badge.set_text("ALGO PAUSED")
+                auto_badge.props("color=grey-8")
+            else:
+                auto_badge.set_text("AUTO ORDER \u00b7 DRY RUN" if config.AUTO_ORDER_DRY_RUN else "AUTO ORDER \u00b7 LIVE")
+                auto_badge.props("color=orange" if config.AUTO_ORDER_DRY_RUN else "color=red")
+            auto_badge.set_visibility(True)
+
+        def toggle_algo_pause():
+            config.AUTO_ORDER_PAUSED = not config.AUTO_ORDER_PAUSED
+            apply_auto_state()
+            msg = ("Algo trade PAUSED: no new entry orders (open limit orders are still cancelled on red / expiry)."
+                   if config.AUTO_ORDER_PAUSED else "Algo trade RESUMED: new stars can place orders again.")
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+            ui.notify(msg, type="warning" if config.AUTO_ORDER_PAUSED else "positive", position="top")
+
+        def on_auto_toggle(enabled):
+            config.AUTO_ORDER_ENABLED = bool(enabled)
+            apply_auto_state()
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Auto order {'ON' if enabled else 'OFF'} ({'dry run' if config.AUTO_ORDER_DRY_RUN else 'LIVE'})")
+
+        def on_dry_run_toggle(enabled):
+            if enabled:
+                config.AUTO_ORDER_DRY_RUN = True
+                apply_auto_state()
+                return
+            with ui.dialog() as dlg, ui.card():
+                ui.label("Turn OFF dry run? Auto orders will be sent to AlgoDelta and placed with real money.")
+
+                def go_live():
+                    config.AUTO_ORDER_DRY_RUN = False
+                    apply_auto_state()
+                    log(f"[{datetime.now().strftime('%H:%M:%S')}] Dry run OFF - auto orders are LIVE")
+                    dlg.close()
+
+                with ui.row():
+                    ui.button("Cancel", on_click=dlg.close)
+                    ui.button("Yes, go live", on_click=go_live).props("color=red")
+            dlg.on("hide", lambda: dry_cb.set_value(config.AUTO_ORDER_DRY_RUN))   # closing the dialog = stay in dry run
+            dlg.open()
+
+        algo_pause_btn = ui.button("Pause algo trade", on_click=toggle_algo_pause).props("icon=pause color=orange")
+        ui.checkbox("Auto order", value=config.AUTO_ORDER_ENABLED, on_change=lambda ev: on_auto_toggle(ev.value)) \
+            .tooltip("Send an AlgoDelta order for every star support (settings under each index's BEP boards)")
+        dry_cb = ui.checkbox("Dry run", value=config.AUTO_ORDER_DRY_RUN, on_change=lambda ev: on_dry_run_toggle(ev.value)) \
+            .tooltip("Dry run = only log the JSON, send nothing")
+        ui.number("Max orders/day", value=config.AUTO_ORDER_DAILY_LIMIT, min=1, precision=0, step=1,
+                  on_change=lambda ev: setattr(config, "AUTO_ORDER_DAILY_LIMIT", int(ev.value or 1))).classes("w-36").props("dense")
+        apply_auto_state()
 
     with ui.tabs().classes("w-full") as tabs:
         live_tab = ui.tab("Live Scanner")
@@ -343,7 +448,7 @@ def main_page():
                         ui.label(name).classes("text-xl font-bold")
                         ltp_label = ui.label(f"{name} LTP: --")
                         window_label = ui.label("Window: --")
-                        ce_pe_label = ui.label("")
+                        pending_label = ui.label("").classes("text-orange-700 font-bold")
 
                     first_cards, latest_cards = {}, {}
                     with ui.row().classes("gap-4"):
@@ -374,27 +479,111 @@ def main_page():
                     board_tables = {}
                     pending_tracks = []
                     with ui.row().classes("w-full no-wrap items-start gap-4"):
-                        # CE = PE (LTP crossing) matches, left of the BEP boards
-                        matches_col = ui.column().classes("gap-2").style("flex: 2 1 0; min-width: 0")
-                        with matches_col:
-                            ui.label(f"{name} CE = PE (LTP Crossing)").classes("text-md font-bold")
-                            matches_table = ui.table(columns=LIVE_MATCH_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
-                            INVALID_CLASS = "props.row.state === 'invalid' ? 'bg-red-1' : ''"
-                            for col in LIVE_MATCH_COLUMNS:
-                                matches_table.add_slot(
-                                    f"body-cell-{col['name']}",
-                                    f'<q-td key="{col["name"]}" :props="props" :class="{INVALID_CLASS}">{{{{ props.value }}}}</q-td>',
-                                )
+                        # AlgoDelta order settings (per index), left of the BEP boards
+                        ad_cfg = config.AUTO_ORDER[name]
+                        ad_col = ui.column().classes("gap-2").style("flex: 2 1 0; min-width: 0")
+                        with ad_col:
+                            ui.label(f"{name} \u2014 AlgoDelta order (sent for every \u2b50 star support)").classes("text-md font-bold")
+                            ad_url = ui.input("Webhook URL (AlgoDelta: Copy Webhook)", value=ad_cfg["webhook_url"],
+                                              password=True, password_toggle_button=True).classes("w-full")
+                            ad_type = ui.select(list(ORDER_TYPES), value=TYPE_LABEL["strategy_order"],
+                                                label="JSON template to edit (all three are used)").classes("w-full")
+                            with ui.row().classes("w-full gap-2 no-wrap"):
+                                ad_tgt = ui.number("Target (points)", value=ad_cfg["tgt"], min=0, step=1).classes("flex-1")
+                                ad_sl = ui.number("SL (points)", value=ad_cfg["sl"], min=0, step=1).classes("flex-1")
+                                ad_qty = ui.number("Quantity", value=ad_cfg["qty"], min=1, precision=0, step=1).classes("flex-1")
+                            with ui.row().classes("w-full gap-2 no-wrap"):
+                                ad_dist = ui.number("Max BEP \u2192 close (pts) for market entry", value=ad_cfg["max_dist"], min=0, step=1).classes("flex-1")
+                                ad_off = ui.number("Limit price = BEP + (pts)", value=ad_cfg["limit_offset"], min=0, step=1).classes("flex-1")
 
-                            def download_live_csv():
-                                ui.download(export_utils.build_csv(matches_table.rows, LIVE_EXPORT_COLUMNS), f"live_matches_{name.lower()}.csv")
+                            def _template_text(type_key):
+                                return json.dumps(ad_cfg["templates"].get(type_key) or {"type": type_key}, indent=2)
 
-                            def download_live_xlsx():
-                                ui.download(export_utils.build_xlsx(matches_table.rows, LIVE_EXPORT_COLUMNS), f"live_matches_{name.lower()}.xlsx")
+                            ad_template = ui.textarea("JSON template (paste from Syntax Generator)", value=_template_text("strategy_order")) \
+                                .classes("w-full").props("input-style='font-family: monospace; font-size: 12px' rows=14")
+                            ui.label("Placeholders: {symbol} {opt} {signal} {qty} {tgt} {sl} {limit_price} {strike} {expiry} {index} {bep} {ltp}. "
+                                     "{symbol} = index + expiry + strike + CE/PE, e.g. NIFTY17NOV2625400CE. {signal} = UP for CE, DOWN for PE. "
+                                     "Stars after 09:15 enter from the next candle: market entry if the support close is within the max distance of BEP, "
+                                     "otherwise a limit buy at BEP + offset, cancelled when the support turns red or the 15-minute window ends unfilled.").classes("text-xs text-gray-500")
+                            ad_confirm = ui.checkbox("I checked this JSON against the Syntax Generator", value=ad_cfg["confirmed"])
+                            ad_status = ui.label("")
 
-                            with ui.row().classes("gap-3"):
-                                ui.button("Download CSV", on_click=download_live_csv)
-                                ui.button("Download XLSX", on_click=download_live_xlsx)
+                            def on_ad_type_change(ev):
+                                ad_template.set_value(_template_text(ORDER_TYPES[ev.value]))
+                                ad_confirm.set_value(False)                  # another template must be re-confirmed
+                                ad_status.set_text(f"{ev.value} selected - press Save to use it.")
+
+                            ad_type.on_value_change(on_ad_type_change)
+                            ad_template.on_value_change(lambda ev: ad_confirm.set_value(False))   # any edit must be re-confirmed
+
+                            def _parse_template():
+                                key = ORDER_TYPES[ad_type.value]
+                                try:
+                                    obj = json.loads(ad_template.value)
+                                except ValueError as ex:
+                                    return None, key, f"JSON error: {ex}"
+                                if not isinstance(obj, dict):
+                                    return None, key, "The template must be one JSON object { ... }."
+                                if obj.get("type") != key:
+                                    return None, key, f"\"type\" must be \"{key}\" for {ad_type.value} (found {obj.get('type')!r})."
+                                return obj, key, ""
+
+                            def _numbers():
+                                def num(v):
+                                    return None if v is None else (int(v) if float(v) == int(v) else float(v))
+                                tgt, sl, qty = num(ad_tgt.value), num(ad_sl.value), num(ad_qty.value)
+                                if tgt is None or sl is None or tgt <= 0 or sl <= 0:
+                                    return None, "Target and SL must be numbers above 0."
+                                if qty is None or qty < 1 or qty != int(qty):
+                                    return None, "Quantity must be a whole number of at least 1."
+                                dist, off = num(ad_dist.value), num(ad_off.value)
+                                if dist is None or off is None or dist < 0 or off < 0:
+                                    return None, "Max distance and limit offset must be numbers (0 or more)."
+                                return {"tgt": tgt, "sl": sl, "qty": int(qty), "max_dist": dist, "limit_offset": off}, ""
+
+                            def save_auto_order_settings():
+                                obj, key, err = _parse_template()
+                                if obj is None:
+                                    ad_status.set_text("\u274c " + err)
+                                    return
+                                nums, err = _numbers()
+                                if nums is None:
+                                    ad_status.set_text("\u274c " + err)
+                                    return
+                                url = (ad_url.value or "").strip()
+                                if url and not url.lower().startswith("https://"):
+                                    ad_status.set_text("\u274c The webhook URL must start with https://")
+                                    return
+                                ad_cfg["templates"][key] = obj
+                                ad_cfg.update(webhook_url=url, confirmed=bool(ad_confirm.value), **nums)
+                                ad_status.set_text(f"\u2705 Saved ({ad_type.value}): target {nums['tgt']}, SL {nums['sl']}, qty {nums['qty']}, "
+                                                   f"market entry up to {nums['max_dist']} pts above BEP, else limit at BEP + {nums['limit_offset']}; "
+                                                   f"webhook {'set' if url else 'NOT set'}; JSON {'confirmed' if ad_confirm.value else 'NOT confirmed'} "
+                                                   f"(live orders need both). Lasts until the app restarts.")
+                                log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} AlgoDelta settings saved ({ad_type.value}).")
+
+                            def preview_auto_order():
+                                obj, key, err = _parse_template()
+                                if obj is None:
+                                    ad_status.set_text("\u274c " + err)
+                                    return
+                                nums, err = _numbers()
+                                if nums is None:
+                                    ad_status.set_text("\u274c " + err)
+                                    return
+                                sample = {"index": name, "opt": "CE", "strike": SAMPLE_STRIKE.get(name, 25400),
+                                          "expiry": "2026-11-17", "bep": 100.0, "ltp": 101.5, "order_type": key,
+                                          "limit_price": 100.0 + nums["limit_offset"]}
+                                payload = order_bridge.build_payload(sample, obj, nums)
+                                with ui.dialog() as dlg, ui.card():
+                                    ui.label(f"Sample order JSON ({name} {sample['strike']} CE, expiry 17 Nov 2026) - this is what would be POSTed").classes("font-bold")
+                                    ui.code(json.dumps(payload, indent=2), language="json")
+                                    ui.button("Close", on_click=dlg.close)
+                                dlg.open()
+
+                            with ui.row().classes("w-full gap-2"):
+                                ui.button("Save", on_click=save_auto_order_settings)
+                                ui.button("Preview JSON", on_click=preview_auto_order).props("outline")
 
                         for opt in ("CE", "PE"):
                             with ui.column().classes("gap-2").style("flex: 1 1 0; min-width: 0"):
@@ -412,6 +601,40 @@ def main_page():
                                     """,
                                 )
                                 board_tables[opt] = table
+
+                    # CE = PE (LTP crossing): below the BEP Support boards, with its own on/off checkbox
+                    with ui.row().classes("items-center gap-4"):
+                        ce_pe_cb = ui.checkbox(f"{name} CE = PE (LTP Crossing)", value=config.INDEXES[name]["ce_pe"]) \
+                            .classes("text-md font-bold")
+                        ce_pe_label = ui.label("")
+                    matches_col = ui.column().classes("w-full gap-2")
+                    with matches_col:
+                        matches_table = ui.table(columns=LIVE_MATCH_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
+                        INVALID_CLASS = "props.row.state === 'invalid' ? 'bg-red-1' : ''"
+                        for col in LIVE_MATCH_COLUMNS:
+                            matches_table.add_slot(
+                                f"body-cell-{col['name']}",
+                                f'<q-td key="{col["name"]}" :props="props" :class="{INVALID_CLASS}">{{{{ props.value }}}}</q-td>',
+                            )
+
+                        def download_live_csv():
+                            ui.download(export_utils.build_csv(matches_table.rows, LIVE_EXPORT_COLUMNS), f"live_matches_{name.lower()}.csv")
+
+                        def download_live_xlsx():
+                            ui.download(export_utils.build_xlsx(matches_table.rows, LIVE_EXPORT_COLUMNS), f"live_matches_{name.lower()}.xlsx")
+
+                        with ui.row().classes("gap-3"):
+                            ui.button("Download CSV", on_click=download_live_csv)
+                            ui.button("Download XLSX", on_click=download_live_xlsx)
+
+                    def on_ce_pe_change(ev):
+                        config.INDEXES[name]["ce_pe"] = bool(ev.value)
+                        matches_col.set_visibility(bool(ev.value))
+                        ce_pe_label.set_text("" if ev.value else "CE = PE: off")
+                        log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} CE = PE scanning {'ENABLED' if ev.value else 'DISABLED'}")
+
+                    ce_pe_cb.on_value_change(on_ce_pe_change)
+                    matches_col.set_visibility(config.INDEXES[name]["ce_pe"])
 
                 def render_board():
                     view = mon.board_view()
@@ -499,15 +722,52 @@ def main_page():
                         matches_table.update()
 
                 section.set_visibility(config.INDEXES[name]["enabled"])
-                matches_col.set_visibility(config.CE_PE_ENABLED)
                 return {"section": section, "ltp_label": ltp_label, "window_label": window_label,
-                        "ce_pe_label": ce_pe_label, "matches_col": matches_col,
+                        "ce_pe_label": ce_pe_label, "pending_label": pending_label,
                         "handle_scan": handle_scan, "process_followups": process_followups,
                         "render_board": render_board, "render_first": render_first_cards,
                         "render_latest": render_latest_cards, "render_all": render_all}
 
             for _idx in config.INDEXES:
                 panels[_idx] = build_panel(_idx)
+
+            # ---- AlgoDelta orders (dry run and live), newest first, also saved to orders_YYYY-MM-DD.csv
+            ui.separator()
+            ui.label("AlgoDelta orders \u2014 every order, cancel and blocked attempt (dry run and live)").classes("text-md font-bold")
+            orders_table = ui.table(columns=ORDER_COLUMNS, rows=list(reversed(order_log)), row_key="id").classes("w-full").props("dense")
+            orders_table.add_slot("body-cell-status", '''
+                <q-td key="status" :props="props">
+                    <q-badge :color="props.value === 'SENT' ? 'green' : props.value === 'DRY RUN' ? 'blue' : props.value === 'FAILED' ? 'red' : 'orange'">{{ props.value }}</q-badge>
+                </q-td>''')
+            orders_table.add_slot("body-cell-payload", '''
+                <q-td key="payload" :props="props" style="max-width: 420px; white-space: normal; word-break: break-all; font-family: monospace; font-size: 11px">{{ props.value }}</q-td>''')
+            orders_table.add_slot("body-cell-detail", '''
+                <q-td key="detail" :props="props" style="max-width: 260px; white-space: normal; word-break: break-word">{{ props.value }}</q-td>''')
+
+            def add_order_row(sig, res):
+                kind = sig.get("kind")
+                row = {
+                    "id": len(order_log), "time": datetime.now().strftime("%H:%M:%S"), "index": sig["index"], "opt": sig["opt"],
+                    "strike": sig["strike"], "kind": ORDER_KIND.get(kind, kind), "bep": round(float(sig["bep"]), 2),
+                    "ltp": round(float(sig["ltp"]), 2),
+                    "limit_price": sig.get("limit_price") if kind in ("limit", "cancel") else "",
+                    "status": ORDER_STATUS.get(res["status"], res["status"]), "detail": res["detail"],
+                    "payload": json.dumps(res["payload"]),
+                }
+                order_log.append(row)
+                _save_order_row(row)
+                orders_table.rows = list(reversed(order_log))
+                orders_table.update()
+
+            def download_orders_csv():
+                ui.download(export_utils.build_csv(list(order_log), ORDER_EXPORT_COLUMNS), f"algodelta_orders_{datetime.now().strftime('%Y-%m-%d')}.csv")
+
+            def download_orders_xlsx():
+                ui.download(export_utils.build_xlsx(list(order_log), ORDER_EXPORT_COLUMNS), f"algodelta_orders_{datetime.now().strftime('%Y-%m-%d')}.xlsx")
+
+            with ui.row().classes("gap-3"):
+                ui.button("Download CSV", on_click=download_orders_csv)
+                ui.button("Download XLSX", on_click=download_orders_xlsx)
 
             ui.separator()
             log_area = ui.markdown("")
@@ -541,7 +801,7 @@ def main_page():
                         p["ltp_label"].set_text(f"{name} LTP: {ltp}")
 
                         # ---- CE = PE (LTP crossing) scan
-                        if config.CE_PE_ENABLED:
+                        if config.INDEXES[name].get("ce_pe", True):
                             try:
                                 market_open = market_utils.is_market_open()
                                 scan_logs = []
@@ -562,7 +822,7 @@ def main_page():
                             except Exception as ex:
                                 log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} CE = PE error: {ex}")
                         else:
-                            p["ce_pe_label"].set_text("")
+                            p["ce_pe_label"].set_text("CE = PE: off")
 
                         # ---- BEP Support
                         try:
@@ -580,6 +840,14 @@ def main_page():
                             support_alerts = mon.pop_support_alerts()
                             if support_alerts:
                                 notifier.dispatch_support_alerts(support_alerts, log_fn=log)
+                            pend = mon.pending_summary()
+                            p["pending_label"].set_text("Pending limit: " + ", ".join(pend) if pend else "")
+                            for sig in mon.pop_order_signals():
+                                res = await run.io_bound(order_bridge.send_order, sig)
+                                log(f"[{datetime.now().strftime('%H:%M:%S')}] {res['message']}")
+                                add_order_row(sig, res)
+                                ui.notify(res["message"][:160], type={"sent": "positive", "dry_run": "info"}.get(res["status"], "negative"),
+                                          position="top", timeout=15000)
                         except Exception as ex:
                             log(f"[{datetime.now().strftime('%H:%M:%S')}] {name} BEP monitor error: {ex}")
                 finally:
