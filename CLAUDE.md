@@ -7,7 +7,7 @@ project's Replay).
 
 ## What the app is
 A NiceGUI app that watches NIFTY (and optionally SENSEX) weekly options for **LTP Crossing (CE = PE)**: inside a small
-window of strikes around the index, any rounded CE price equal to any rounded PE price is a match. Data comes from the
+band around the nearest strike, that strike's rounded CE price equal to its own rounded PE price is a match. Data comes from the
 Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and Telegram were removed on purpose
 (PR #1). Don't add them back unless the user asks.
 
@@ -19,10 +19,16 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - There is no Upstox token in the cloud session: test with a fake client (see "Testing") and say that real data is untested.
 
 ## Rules of the CE = PE scan
-- **Match rule** (`match_logic.py`, shared by live, replay and backtest): every CE and PE price in the window is rounded
-  half-up (130.50 → 131). Any rounded CE equal to any rounded PE is a match; the strikes may differ.
-- **Strike window:** nearest strike to the index LTP ± `STRIKES_EACH_SIDE` (default 2 → 5 strikes; side panel slider).
-  Strike step: NIFTY 50, SENSEX 100. Re-centred every `RECALC_INTERVAL_SECONDS` (60 s).
+- **Match rule** (`match_logic.py`, shared by live, replay and backtest; PR #4, asked to cut too many matches):
+  - **Near strike only:** checked only while `strike − near_band < index LTP ≤ strike + near_band`
+    (`match_logic.near_strike`). NIFTY band 10: 25091–25110 → 25100, 25141–25160 → 25150, 25111–25140 → no check.
+    SENSEX band 20 (strikes 100 apart). Bands are per index in `config.INDEXES[..]["near_band"]`, editable in the side
+    panel (Save Band; at most half the strike step).
+  - **Same strike only:** that strike's own CE vs its own PE (the user was explicit: "CE and PE should be in the same
+    strike price"). No cross-strike matches.
+  - Both prices rounded half-up (130.50 → 131); equal rounded prices = a match.
+- **Strike window** (`StateManager`, ± `STRIKES_EACH_SIDE`, re-centred every 60 s) is now internal bookkeeping only
+  (expiry, freeze); it no longer decides what is matched. The strike count slider was replaced by the band inputs.
 - **Scan:** every `SCAN_INTERVAL_SECONDS` (10 s, side panel), only during market hours (`MARKET_OPEN` 09:15 –
   `MARKET_CLOSE` 15:40 IST, weekdays, not `MARKET_HOLIDAYS`).
 - **Cooldown:** after a match the window freezes and further matches are hidden for `COOLDOWN_SECONDS` (5 min). All
@@ -35,9 +41,10 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 
 ## Files
 - `app.py`: the UI (single page, port 8082).
-  - Side panel: Upstox token (Save & Test Connection), Scanner (strike count, Rescan, scan interval).
+  - Side panel: Upstox token (Save & Test Connection), Scanner (NIFTY / SENSEX near-strike band, Rescan, scan interval).
   - Top bar: Pause alerts, NIFTY / SENSEX checkboxes.
-  - Tabs: **Live Scanner** (per index: LTP, window, CE = PE on/off, matches table, CSV/XLSX), **Replay**, **Backtest**.
+  - Tabs: **Live Scanner** (per index: LTP, "Near strike: 25100 (checking CE = PE)" or "none - not checking", CE = PE
+    on/off, matches table, CSV/XLSX), **Replay**, **Backtest**.
   - Log panel at the bottom: repeated messages within the last 20 lines merge into one line with an `(xN)` counter;
     20 lines shown, 200 kept.
 - `scanner.py`: `run_scan_cycle(client, state_mgr, ..., now=None)`, one scan of one index. `now` is used by replay.
@@ -45,8 +52,8 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - `match_logic.py`: the match rule. `models.py`: `StrikeWindow`, `MatchEvent`, `ScanState`.
 - `tracker.py`: the 5-minute follow-up check.
 - `replay.py`: **Replay a past day** (see below).
-- `backtest.py`: Backtest tab, NIFTY only. Lists every raw crossing on 1-minute closes over a fixed window (union of the
-  open and close windows), **cooldown ignored**.
+- `backtest.py`: Backtest tab, NIFTY only. Lists every raw crossing on 1-minute closes at each minute's near strike
+  (same rule as live), **cooldown ignored**.
 - `market_utils.py`: market hours, strike window, expiry helpers (`expiry_cycle_dates` = days that can be replayed),
   cached option instrument keys.
 - `upstox_client.py`: Upstox REST calls (LTP, option chain, contracts, 1-minute / N-minute / daily candles).
@@ -57,10 +64,10 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - Replay tab: index + date (Load dates lists the current weekly expiry cycle) → Replay. No alerts; the live scan keeps
   running.
 - `ReplayClient` wraps the Upstox client for one day, and the **live code** runs on it, one scan per 1-minute candle
-  09:15–15:29: index close = LTP (window re-centred every minute), each leg's 1-minute close = its LTP (last close
+  09:15–15:29: index close = LTP (decides the near strike), the near strike's 1-minute CE / PE closes = LTPs (last close
   carried forward if it didn't trade that minute), same cooldown, then `tracker.process_pending` on that day's
   5-minute candles. Keep replay going through the live code so the two never drift apart.
-- Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Window, Checked Till, Closed Above, Result (green = Valid,
+- Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Index LTP, Checked Till, Closed Above, Result (green = Valid,
   red = Invalid / No data). CSV/XLSX download.
 - Limits: only days of the current weekly expiry (older contracts' keys are no longer listed by Upstox); one price per
   minute, so a crossing lasting only seconds inside a minute is missed (live scans every 10 s).
