@@ -1,14 +1,13 @@
 """
-notifier.py — dispatches CE = PE alerts across all channels:
-NiceGUI in-app toast, browser Notification API, and Telegram.
+notifier.py — dispatches CE = PE alerts:
+NiceGUI in-app toast and the browser Notification API.
 
 Several matches can arrive in one scan cycle (and from both NIFTY and SENSEX): each gets its own
-toast and browser notification, while Telegram sends one combined message listing all of them.
+toast and browser notification.
 """
 from nicegui import ui
 
 import config
-import telegram_bot
 
 
 def _label(event) -> str:
@@ -38,33 +37,13 @@ def fire_browser_notification(event):
     """)
 
 
-def fire_telegram(events: list):
-    """
-    Sends to every configured chat ID (comma-separated). Returns (all_ok, err_summary).
-    A partial failure (some recipients succeeded, others didn't) still
-    returns False so it gets logged, but doesn't stop the successful sends
-    from having gone out - send_message_to_all already tried every recipient.
-    """
-    if not config.TELEGRAM_ENABLED:
-        return True, "disabled"
-    msg = telegram_bot.build_match_message(events)
-    all_ok, results = telegram_bot.send_message_to_all(msg)
-    if all_ok:
-        return True, ""
-    failed = [f"{cid}: {err}" for cid, ok, err in results if not ok]
-    return False, "; ".join(failed)
-
-
 def dispatch_match_alerts(events: list, log_fn=print):
     """Fires all channels for every CE = PE match found in a scan cycle (unless alerts are off or paused)."""
     if not config.MATCH_ALERTS_ENABLED:
         return
     if config.ALERTS_PAUSED:
-        log_fn(f"Alerts paused: {len(events)} match alert(s) not sent (toast, browser, Telegram).")
+        log_fn(f"Alerts paused: {len(events)} match alert(s) not sent (toast, browser).")
         return
     for e in events:
         fire_toast(e)
         fire_browser_notification(e)
-    ok, err = fire_telegram(events)
-    if not ok:
-        log_fn(f"Telegram send failed: {err}")

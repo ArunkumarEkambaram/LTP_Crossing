@@ -29,11 +29,6 @@ RECALC_INTERVAL_SECONDS = 60      # re-center the strike window every 1 min
 TRACK_FINALIZE_DELAY_SECONDS = 10   # wait this long after a 5-min candle closes before reading it
 TRACK_GIVE_UP_SECONDS = 180         # if the candle is still missing after this, stop waiting for it
 
-# Telegram — fill in directly, or wire up a settings page later like Stock Price Alert
-TELEGRAM_BOT_TOKEN = ""
-TELEGRAM_CHAT_ID = ""
-TELEGRAM_ENABLED = True
-
 # Upstox
 UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
 
@@ -44,7 +39,7 @@ MARKET_CLOSE = "15:40"
 MARKET_HOLIDAYS = []
 
 # Alert pause switch (top-bar button in the UI). While True, CE = PE matches are still found and
-# tabled, but NO toast, browser notification or Telegram message is sent. Matches found while paused
+# tabled, but NO toast or browser notification is shown. Matches found while paused
 # are not sent after resuming. In-memory only (resets to False).
 ALERTS_PAUSED = False
 
@@ -52,6 +47,6 @@ ALERTS_PAUSED = False
 # CE = PE is switched on/off per index with the checkbox in that index's section (INDEXES[..]["ce_pe"]).
 COOLDOWN_SECONDS = 5 * 60         # freeze the window + suppress further matches for 5 min after a match
 COOLDOWN_GRACE_SECONDS = 0        # optional early-unfreeze tolerance (not needed at this scan rate)
-# CE = PE alerts (toast, browser, Telegram). False = matches still appear in the table and are followed
+# CE = PE alerts (toast, browser). False = matches still appear in the table and are followed
 # up, but no notification is sent.
 MATCH_ALERTS_ENABLED = False

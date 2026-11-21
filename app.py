@@ -7,7 +7,6 @@ from nicegui import ui, run
 import config
 import upstox_client
 import notifier
-import telegram_bot
 import market_utils
 import backtest
 import export_utils
@@ -123,39 +122,6 @@ def main_page():
     """)
 
     with ui.left_drawer(value=True, fixed=False).classes("bg-gray-100 p-4") as drawer:
-        ui.label("Telegram Settings").classes("text-lg font-bold")
-        tg_token_input = ui.input("Bot Token", value=config.TELEGRAM_BOT_TOKEN, password=True, password_toggle_button=True).classes("w-full")
-        tg_chat_id_input = ui.input("Chat ID(s) — comma-separated", value=config.TELEGRAM_CHAT_ID).classes("w-full")
-        tg_status_label = ui.label("Status: not configured" if not (config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID) else "Status: unverified")
-
-        def save_and_test_telegram():
-            bot_token = tg_token_input.value.strip()
-            chat_id_raw = tg_chat_id_input.value.strip()
-            if not bot_token or not chat_id_raw:
-                tg_status_label.set_text("Status: bot token and chat ID(s) both required")
-                config.TELEGRAM_ENABLED = False
-                return
-            config.TELEGRAM_BOT_TOKEN = bot_token
-            config.TELEGRAM_CHAT_ID = chat_id_raw
-            all_ok, results = telegram_bot.test_telegram(bot_token, chat_id_raw)
-            succeeded = [cid for cid, ok, _ in results if ok]
-            failed = [(cid, err) for cid, ok, err in results if not ok]
-            config.TELEGRAM_ENABLED = len(succeeded) > 0
-
-            if all_ok:
-                tg_status_label.set_text(f"Status: connected — test sent to {len(succeeded)} chat ID(s)")
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram saved and verified ({len(succeeded)} chat ID(s)).")
-            else:
-                fail_txt = "; ".join(f"{cid} ({err})" for cid, err in failed)
-                if succeeded:
-                    tg_status_label.set_text(f"Status: partial — sent to {len(succeeded)}, failed: {fail_txt}")
-                else:
-                    tg_status_label.set_text(f"Status: failed for all — {fail_txt}")
-                log(f"[{datetime.now().strftime('%H:%M:%S')}] Telegram test — failures: {fail_txt}")
-
-        ui.button("Save & Test Telegram", on_click=save_and_test_telegram).classes("w-full")
-        
-        ui.separator()
         ui.label("Upstox").classes("text-lg font-bold")
         with ui.column().classes("w-full gap-1"):
             token_input = ui.input("Upstox Access Token", value=config.UPSTOX_ACCESS_TOKEN, password=True, password_toggle_button=True).classes("w-full")
