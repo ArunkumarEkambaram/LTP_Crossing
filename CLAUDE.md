@@ -17,6 +17,10 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - `__pycache__/` and `*.pyc` are git-ignored; never commit them. `.gitignore` also keeps `/Working Project_13_10_2026`.
 - The cloud session can't delete GitHub branches (proxy 403). The user deletes merged branches on GitHub.
 - There is no Upstox token in the cloud session: test with a fake client (see "Testing") and say that real data is untested.
+- When a new rule is ambiguous, ask the user first with a few options and a recommended one, then build what they pick
+  (worked well for the 6-candle watch). Their numbers in messages are usually **examples**, not fixed levels
+  (e.g. "25091–25110" meant "near any 50 / 100 strike").
+- The user checks results against TradingView 1-minute charts and replays past days on market holidays.
 
 ## Rules of the CE = PE scan
 - **Match rule** (`match_logic.py`, shared by live, replay and backtest):
@@ -54,6 +58,8 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
   - Top bar: Pause alerts, NIFTY / SENSEX checkboxes.
   - Tabs: **Live Scanner** (per index: LTP, "Strikes: 25400, 25450, 25500", CE = PE on/off, matches table,
     CSV/XLSX), **Replay**, **Backtest**.
+  - Live matches table: Time, CE Strike, PE Strike, Rounded Price, Checked Till, Breakout, Best move, Result.
+  - Rescan: unfreezes the cooldown and re-centres the window on the next scan.
   - Log panel at the bottom: repeated messages within the last 20 lines merge into one line with an `(xN)` counter;
     20 lines shown, 200 kept.
 - `scanner.py`: `run_scan_cycle(client, state_mgr, ..., now=None)`, one scan of one index. `now` is used by replay.
@@ -62,7 +68,7 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - `tracker.py`: the 6-candle follow-up watch (breakout then hold).
 - `replay.py`: **Replay a past day** (see below).
 - `backtest.py`: Backtest tab, NIFTY only. Lists every raw same-strike crossing on 1-minute closes over each minute's
-  window (same rule as live), **cooldown ignored**.
+  window (same rule as live), **cooldown ignored, no 6-candle watch** (use Replay for results).
 - `market_utils.py`: market hours, strike window, expiry helpers (`expiry_cycle_dates` = days that can be replayed),
   cached option instrument keys.
 - `upstox_client.py`: Upstox REST calls (LTP, option chain, contracts, 1-minute / N-minute / daily candles).
@@ -75,7 +81,8 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 - `ReplayClient` wraps the Upstox client for one day, and the **live code** runs on it, one scan per 1-minute candle
   09:15–15:29: index close = LTP (re-centres the window), each window strike's 1-minute CE / PE closes = LTPs (last close
   carried forward if it didn't trade that minute), same cooldown, then `tracker.process_pending` (6-candle watch) on
-  that day's 5-minute candles (today: only closed candles, so late matches stay WATCHING). Keep replay going through the live code so the two never drift apart.
+  that day's 5-minute candles (today: only closed candles, so late matches stay WATCHING). Keep replay going
+  through the live code so the two never drift apart.
 - Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Index LTP, Checked Till, Breakout, Best move, Result.
   CSV/XLSX download.
 - Limits: only days of the current weekly expiry (older contracts' keys are no longer listed by Upstox); one price per
@@ -84,8 +91,22 @@ Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and
 ## Testing (no Upstox token in the cloud)
 - Unit-test logic with a fake client class that returns made-up candles / contracts / expiries.
 - UI check: run the app with `upstox_client.UpstoxClient` and `upstox_client.test_connection` patched to the fake, then
-  drive it with Playwright (Chromium is pre-installed) and look at a screenshot.
+  drive it with Playwright (Chromium is pre-installed) and look at a screenshot. Patch `market_utils.is_market_open`
+  to `True` to see the live scan outside market hours.
+- The cloud clock is UTC. Live `MatchEvent.triggered_at` is a naive `datetime.now()` that the app treats as local time
+  (IST on the user's PC), so times like "Checked Till" look 5:30 h off in the cloud only. Not a bug for the user.
+- Upstox (`api.upstox.com`) is blocked from the cloud session (proxy 403), even for historical candles.
+
+## History (PRs, all merged into `master`)
+1. **#1** Kept only LTP Crossing: removed AlgoDelta, BEP Support (boards, cards, uploads, support backtest), Telegram.
+   Log panel trimmed (repeats merged with `(xN)`), CE = PE alerts on, `__pycache__` untracked.
+2. **#2** Replay tab (`replay.py`, `ReplayClient`), `scanner.run_scan_cycle(now=...)`, `market_utils.expiry_cycle_dates`.
+3. **#3** This `CLAUDE.md`.
+4. **#4** Same-strike matching only + a ±10 spot-NIFTY band (band later removed).
+5. **#5** Removed the band; same-strike CE = PE on the nearest ± 1 strikes; strike count slider back.
+   The user confirmed the 20 Nov 09:26 25400 match now shows.
+6. **#6** 6-candle watch (breakout then hold), Breakout / Best move / Result columns, WATCHING n/6.
 
 ## Open / not yet verified
-- Replay against real Upstox data (needs the user's token).
-- Backtest is NIFTY only; Replay supports NIFTY and SENSEX.
+- 6-candle results on real Upstox data (e.g. 20 Nov 09:26, 25400 @ 140): needs the user's token / their check.
+- Backtest is NIFTY only and has no 6-candle watch; Replay supports NIFTY and SENSEX.
