@@ -12,7 +12,7 @@ from models import MatchEvent
 
 
 def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True,
-                   index: str = "NIFTY", index_ltp=None) -> dict:
+                   index: str = "NIFTY", index_ltp=None, now=None) -> dict:
     """
     Runs a single scan cycle for ONE index (`index` = "NIFTY" or "SENSEX"; `index_ltp` = its spot LTP
     if the caller already fetched it, otherwise it is fetched here). With detect=False (market closed) it only fetches the
@@ -21,10 +21,11 @@ def run_scan_cycle(client, state_mgr, log_fn=print, detect: bool = True,
     Returns a summary dict:
     {nifty_ltp, window, quotes, matches, frozen, cooldown_remaining, errors}
     "matches" is a list of MatchEvent (empty list if none found this cycle).
+    `now` defaults to the current time; replay.py passes the simulated time of a past day.
     """
     summary = {"nifty_ltp": None, "index_ltp": None, "window": None, "quotes": {}, "matches": [], "errors": []}
     cfg = config.INDEXES[index]
-    now = datetime.now()
+    now = now or datetime.now()
 
     state_mgr.maybe_unfreeze(now)
 

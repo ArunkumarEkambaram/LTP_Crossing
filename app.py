@@ -9,6 +9,7 @@ import upstox_client
 import notifier
 import market_utils
 import backtest
+import replay
 import export_utils
 import scanner
 import tracker
@@ -43,6 +44,20 @@ LIVE_MATCH_COLUMNS = [
     {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
 ]
 LIVE_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in LIVE_MATCH_COLUMNS]
+
+REPLAY_COLUMNS = [
+    {"name": "time", "label": "Time", "field": "time"},
+    {"name": "ce_strike", "label": "CE Strike", "field": "ce_strike"},
+    {"name": "pe_strike", "label": "PE Strike", "field": "pe_strike"},
+    {"name": "ce_ltp", "label": "CE LTP", "field": "ce_ltp"},
+    {"name": "pe_ltp", "label": "PE LTP", "field": "pe_ltp"},
+    {"name": "price", "label": "Rounded Price", "field": "price"},
+    {"name": "window", "label": "Window", "field": "window"},
+    {"name": "check_till", "label": "Checked Till", "field": "check_till"},
+    {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
+    {"name": "result", "label": "Result", "field": "result"},
+]
+REPLAY_EXPORT_COLUMNS = [(c["name"], c["label"]) for c in REPLAY_COLUMNS]
 
 COMMENT_CELL_SLOT = '''
     <q-td key="comment" :props="props">
@@ -230,6 +245,7 @@ def main_page():
 
     with ui.tabs().classes("w-full") as tabs:
         live_tab = ui.tab("Live Scanner")
+        replay_tab = ui.tab("Replay")
         backtest_tab = ui.tab("Backtest")
 
     with ui.tab_panels(tabs, value=live_tab).classes("w-full"):
@@ -455,6 +471,82 @@ def main_page():
                 bt_results_table.update()
 
             bt_run_button.on_click(run_backtest_click)
+
+        # ======================================================== REPLAY TAB
+        with ui.tab_panel(replay_tab):
+            ui.label("Replay a past day: runs the live CE = PE scanner minute by minute on Upstox historical candles "
+                     "(window re-centred every minute, 5-minute cooldown after a match, each match judged on its "
+                     "5-minute candle). Uses the strike count from the side panel. No alerts; the live scan keeps running. "
+                     "Only days of the current weekly expiry can be replayed (older contracts have expired).") \
+                .classes("text-sm text-gray-600")
+
+            rp = {"rows": [], "name": "", "date": ""}
+            with ui.row().classes("items-center gap-3"):
+                rp_index = ui.select(list(config.INDEXES), value=next(iter(config.INDEXES)), label="Index").classes("w-36")
+                rp_date = ui.select([], label="Date").classes("w-48")
+                rp_load_btn = ui.button("Load dates", icon="event")
+                rp_run_btn = ui.button("Replay", icon="replay").props("color=orange")
+            rp_info = ui.label("").classes("font-bold")
+
+            rp_table = ui.table(columns=REPLAY_COLUMNS, rows=[], row_key="id").classes("w-full").props("dense")
+            rp_row_class = "props.row.state === 'valid' ? 'bg-green-1' : (props.row.state ? 'bg-red-1' : '')"
+            for col in REPLAY_COLUMNS:
+                rp_table.add_slot(
+                    f"body-cell-{col['name']}",
+                    f'<q-td key="{col["name"]}" :props="props" :class="{rp_row_class}">{{{{ props.value }}}}</q-td>',
+                )
+
+            def _rp_file(ext):
+                return f"replay_{rp['name'].lower()}_{rp['date']}.{ext}"
+
+            with ui.row().classes("gap-3"):
+                ui.button("Download CSV", on_click=lambda: ui.download(
+                    export_utils.build_csv(rp["rows"], REPLAY_EXPORT_COLUMNS), _rp_file("csv")))
+                ui.button("Download XLSX", on_click=lambda: ui.download(
+                    export_utils.build_xlsx(rp["rows"], REPLAY_EXPORT_COLUMNS), _rp_file("xlsx")))
+
+            async def rp_load_dates():
+                if not token_connected:
+                    rp_info.set_text("Connect the Upstox token first (side panel).")
+                    return
+                name = rp_index.value
+                expiry, dates = await run.io_bound(market_utils.expiry_cycle_dates, client,
+                                                   config.INDEXES[name]["underlying_key"])
+                if not expiry:
+                    rp_info.set_text(f"Could not read the {name} expiry from Upstox.")
+                    return
+                rp_date.set_options(list(reversed(dates)))
+                rp_date.set_value(dates[-1] if dates else None)
+                rp_info.set_text(f"{name} expiry {expiry}: {len(dates)} day(s) can be replayed.")
+
+            async def rp_run():
+                if not token_connected:
+                    rp_info.set_text("Connect the Upstox token first (side panel).")
+                    return
+                name, date_str = rp_index.value, rp_date.value
+                rp_run_btn.disable()
+                rp_info.set_text(f"Replaying {name} {date_str or ''} (downloading candles)...")
+                try:
+                    msgs = []
+                    res = await run.io_bound(replay.run, client, name, date_str, msgs.append)
+                    for m in msgs:
+                        log(f"[{datetime.now().strftime('%H:%M:%S')}] {m}")
+                    if res["error"]:
+                        rp_info.set_text("\u274c " + res["error"])
+                        return
+                    rp.update(rows=res["rows"], name=name, date=date_str)
+                    rp_table.rows = list(reversed(res["rows"]))      # newest first, like the live table
+                    rp_table.update()
+                    rp_info.set_text(res["info"])
+                    log(f"[{datetime.now().strftime('%H:%M:%S')}] {res['info']}")
+                except Exception as ex:
+                    rp_info.set_text(f"\u274c Replay failed: {ex}")
+                finally:
+                    rp_run_btn.enable()
+
+            rp_load_btn.on_click(rp_load_dates)
+            rp_run_btn.on_click(rp_run)
+            rp_index.on_value_change(lambda ev: (rp_date.set_options([]), rp_date.set_value(None)))
 
 
 ui.run(title="LTP Crossing (CE = PE)", port=8082, reload=False)

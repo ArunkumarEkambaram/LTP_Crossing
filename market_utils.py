@@ -57,6 +57,26 @@ def current_weekly_expiry(client, underlying_key: str = None):
     return expiries[0]  # ascending order -> nearest expiry first
 
 
+def expiry_cycle_dates(client, underlying_key: str = None):
+    """
+    (expiry_date_str, [dates]) for the index's current weekly expiry cycle: the 7 days ending on the
+    nearest expiry, weekdays only, not in the future, not in config.MARKET_HOLIDAYS. Only these days can
+    be replayed: older days' option contracts have expired and Upstox no longer lists their keys.
+    """
+    expiry_str = current_weekly_expiry(client, underlying_key)
+    if not expiry_str:
+        return None, []
+    expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
+    today = datetime.now(IST).date()
+    dates = []
+    d = expiry_date - timedelta(days=6)
+    while d <= min(expiry_date, today):
+        if d.weekday() < 5 and d.strftime("%Y-%m-%d") not in config.MARKET_HOLIDAYS:
+            dates.append(d.strftime("%Y-%m-%d"))
+        d += timedelta(days=1)
+    return expiry_str, dates
+
+
 def current_weekly_expiry_dates(client):
     """
     Returns (expiry_date_str, [valid_backtest_dates]) for the current weekly
