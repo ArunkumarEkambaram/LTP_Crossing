@@ -81,20 +81,8 @@ def build_match_message(events: list) -> str:
     return "\n".join(lines)
 
 
-def build_support_message(events: list) -> str:
-    """events: list of dicts from BepMonitor.pop_support_alerts() - one message for the whole scan."""
-    bar = "\u2501" * 16
-    lines = ["\U0001f7e2 *BEP Support*", bar]
-    for e in events:
-        how = "failed breakdown" if e.get("rule") == 1 else "touch and go"
-        lines.append(f"[{e['time']}] {e.get('index', 'NIFTY')} {e['opt']} *{e['strike']}* \u2022 BEP {e['bep']:.2f} \u2022 "
-                     f"close {e['close']:.2f} \u2022 {how}")
-    lines.append(bar)
-    return "\n".join(lines)
-
-
 def test_telegram(bot_token: str, chat_id: str):
     """Sends a test message to every chat ID. Returns (all_ok, results)
     — same shape as send_message_to_all."""
-    msg = "\u2705 *BEP Support Monitor* \u2014 Telegram connected successfully!"
+    msg = "\u2705 *LTP Crossing (CE = PE)* \u2014 Telegram connected successfully!"
     return send_message_to_all(msg, bot_token, chat_id)

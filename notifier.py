@@ -1,8 +1,8 @@
 """
-notifier.py — dispatches BEP Support and CE = PE alerts across all channels:
+notifier.py — dispatches CE = PE alerts across all channels:
 NiceGUI in-app toast, browser Notification API, and Telegram.
 
-Several supports can arrive in one scan cycle (and from both NIFTY and SENSEX): each gets its own
+Several matches can arrive in one scan cycle (and from both NIFTY and SENSEX): each gets its own
 toast and browser notification, while Telegram sends one combined message listing all of them.
 """
 from nicegui import ui
@@ -68,33 +68,3 @@ def dispatch_match_alerts(events: list, log_fn=print):
     ok, err = fire_telegram(events)
     if not ok:
         log_fn(f"Telegram send failed: {err}")
-
-
-# ------------------------------------------------------------------ BEP Support alerts
-def _support_label(e: dict) -> str:
-    how = "failed breakdown" if e.get("rule") == 1 else "touch and go"
-    return (f"{e.get('index', 'NIFTY')} BEP Support {e['opt']}: {e['strike']} | BEP {e['bep']:.2f} | "
-            f"close {e['close']:.2f} | {e['time']} ({how})")
-
-
-def dispatch_support_alerts(events: list, log_fn=print):
-    """Toast + browser notification per new BEP support row, one combined Telegram message."""
-    if not events:
-        return
-    # if config.ALERTS_PAUSED:
-    #     log_fn(f"Alerts paused: {len(events)} BEP support alert(s) not sent (toast, browser, Telegram).")
-    #     return
-    for e in events:
-        label = _support_label(e)
-        ui.notify(label, type="positive", position="top", timeout=10000)
-        ui.run_javascript(f"""
-            if (Notification.permission === "granted") {{
-                new Notification({(e.get('index', 'NIFTY') + " BEP Support " + e['opt'])!r}, {{ body: {label!r} }});
-            }}
-        """)
-    if not config.TELEGRAM_ENABLED:
-        return
-    all_ok, results = telegram_bot.send_message_to_all(telegram_bot.build_support_message(events))
-    if not all_ok:
-        failed = [f"{cid}: {err}" for cid, ok, err in results if not ok]
-        log_fn(f"Telegram send failed: {'; '.join(failed)}")
