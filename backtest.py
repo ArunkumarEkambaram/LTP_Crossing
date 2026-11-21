@@ -3,12 +3,12 @@ backtest.py — replays a chosen day's 1-minute candles to find every raw
 CE == PE crossing that would have happened, ignoring the live cooldown.
 
 Same rule as the live scanner (match_logic.py):
-  - Each 1-minute candle: the Nifty close decides the NEAR strike
-    (strike - band < close <= strike + band). Between bands nothing is checked.
-  - Only that strike's own CE close vs its own PE close, both rounded half-up.
+  - Each 1-minute candle: the window = nearest strike to the Nifty close +/- STRIKES_EACH_SIDE.
+  - Each strike's own CE close vs its own PE close, both rounded half-up.
   - Cooldown/freeze is ignored entirely — every raw match is reported.
 """
 import config
+import market_utils
 import match_logic
 
 
@@ -45,13 +45,12 @@ def run_backtest(client, date_str: str, expiry_date: str, log_fn=print) -> dict:
     summary["day_open"] = day_open
     summary["day_close"] = day_close
 
-    # 2. Near strike of every minute (None between bands)
+    # 2. Window of every minute (nearest strike +/- STRIKES_EACH_SIDE)
     cfg = config.INDEXES["NIFTY"]
-    near_by_ts = {c[0]: match_logic.near_strike(float(c[4]), cfg["strike_interval"], cfg.get("near_band", 10))
-                  for c in nifty_candles}
-    strikes = sorted({s for s in near_by_ts.values() if s is not None})
+    window_by_ts = {c[0]: market_utils.build_strike_window(float(c[4]), cfg["strike_interval"]) for c in nifty_candles}
+    strikes = sorted({s for w in window_by_ts.values() for s in w})
     summary["strikes"] = strikes
-    log_fn(f"Backtest {date_str}: open={day_open} close={day_close} near strikes={strikes}")
+    log_fn(f"Backtest {date_str}: open={day_open} close={day_close} strikes={strikes}")
     if not strikes:
         return summary
 
@@ -63,7 +62,7 @@ def run_backtest(client, date_str: str, expiry_date: str, log_fn=print) -> dict:
         summary["errors"].append(f"Option contract lookup failed: {err}")
         return summary
 
-    # 4. 1-min closes of both legs of every near strike
+    # 4. 1-min closes of both legs of every strike
     series = {}  # strike -> {"CE": {ts: close}, "PE": {ts: close}}
     for strike in strikes:
         legs = {}
@@ -80,13 +79,11 @@ def run_backtest(client, date_str: str, expiry_date: str, log_fn=print) -> dict:
         if len(legs) == 2:
             series[strike] = legs
 
-    # 5. Each minute: CE = PE at that minute's near strike
+    # 5. Each minute: CE = PE at each strike of that minute's window
     for c in nifty_candles:
-        ts, strike = c[0], near_by_ts[c[0]]
-        legs = series.get(strike)
-        if not legs:
-            continue
-        quotes = {strike: {"CE": legs["CE"].get(ts), "PE": legs["PE"].get(ts)}}
+        ts = c[0]
+        quotes = {s: {"CE": series[s]["CE"].get(ts), "PE": series[s]["PE"].get(ts)}
+                  for s in window_by_ts[ts] if s in series}
         for m in match_logic.find_matches(quotes):
             summary["events"].append({
                 "time": ts[11:16] if len(ts) >= 16 else ts,

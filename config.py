@@ -10,18 +10,15 @@ NIFTY_OPTION_UNDERLYING_KEY = "NSE_INDEX|Nifty 50"
 
 # Indices the scanner can watch. "enabled" is the starting state of the NIFTY / SENSEX
 # checkboxes in the top bar (changed at runtime from the UI). A disabled index is not polled at all.
-# "near_band": CE = PE is only checked while the index is within this many points of its nearest strike:
-#   strike - near_band < index LTP <= strike + near_band   (NIFTY 10: 25091-25110 -> 25100, 25141-25160 -> 25150;
-#   25111-25140 -> no check). Editable in the side panel.
 INDEXES = {
     "NIFTY":  {"index_key": "NSE_INDEX|Nifty 50", "underlying_key": "NSE_INDEX|Nifty 50",
-               "strike_interval": 50,  "enabled": True,  "ce_pe": True, "near_band": 10},
+               "strike_interval": 50,  "enabled": True,  "ce_pe": True},
     "SENSEX": {"index_key": "BSE_INDEX|SENSEX",   "underlying_key": "BSE_INDEX|SENSEX",
-               "strike_interval": 100, "enabled": False, "ce_pe": True, "near_band": 20},
+               "strike_interval": 100, "enabled": False, "ce_pe": True},
 }
 
 STRIKE_INTERVAL = 50        # Nifty strike spacing (used by the Nifty-only backtest)
-STRIKES_EACH_SIDE = 2       # internal strike window (bookkeeping only; matching uses the near strike, see "near_band")
+STRIKES_EACH_SIDE = 1       # strikes checked for CE = PE: nearest strike +/- 1 -> 3 strikes (side panel slider)
 
 # Live scan interval (seconds). Editable at runtime from the Live Scanner tab.
 SCAN_INTERVAL_SECONDS = 10
