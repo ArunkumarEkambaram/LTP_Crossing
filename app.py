@@ -52,7 +52,7 @@ REPLAY_COLUMNS = [
     {"name": "ce_ltp", "label": "CE LTP", "field": "ce_ltp"},
     {"name": "pe_ltp", "label": "PE LTP", "field": "pe_ltp"},
     {"name": "price", "label": "Rounded Price", "field": "price"},
-    {"name": "window", "label": "Window", "field": "window"},
+    {"name": "index_ltp", "label": "Index LTP", "field": "index_ltp"},
     {"name": "check_till", "label": "Checked Till", "field": "check_till"},
     {"name": "closed_above", "label": "Closed Above", "field": "closed_above"},
     {"name": "result", "label": "Result", "field": "result"},
@@ -165,18 +165,34 @@ def main_page():
 
         ui.separator()
         ui.label("Scanner").classes("text-lg font-bold")
-        with ui.column().classes("w-full gap-1"):
-            default_total_strikes = 2 * config.STRIKES_EACH_SIDE + 1
-            strike_slider = ui.slider(min=1, max=11, step=2, value=default_total_strikes).classes("w-full")
-            strike_count_label = ui.label(f"Currently: {default_total_strikes} strikes (center ± {config.STRIKES_EACH_SIDE})")
+        ui.label("CE = PE is checked only while the index is within the band of its nearest strike, and only that "
+                 "strike's own CE vs PE (NIFTY ±10: 25091–25110 → 25100, 25111–25140 → no check).") \
+            .classes("text-xs text-gray-600")
+        band_inputs = {}
+        with ui.row().classes("w-full gap-2 no-wrap"):
+            for _idx, _cfg in config.INDEXES.items():
+                band_inputs[_idx] = ui.number(f"{_idx} band (± pts)", value=_cfg["near_band"], min=1, step=1) \
+                    .classes("flex-1")
+        band_label = ui.label("Currently: " + ", ".join(f"{n} ±{c['near_band']}" for n, c in config.INDEXES.items()))
 
-        def save_strike_count():
-            n = int(strike_slider.value)
-            config.STRIKES_EACH_SIDE = (n - 1) // 2
-            strike_count_label.set_text(f"Currently: {n} strikes (center ± {config.STRIKES_EACH_SIDE})")
-            log(f"[{datetime.now().strftime('%H:%M:%S')}] Strike count set to {n}.")
+        def save_bands():
+            for n, inp in band_inputs.items():
+                try:
+                    v = float(inp.value)
+                except (TypeError, ValueError):
+                    band_label.set_text(f"{n}: enter a number of points.")
+                    return
+                if not 0 < v < config.INDEXES[n]["strike_interval"] / 2 + 1:
+                    band_label.set_text(f"{n}: band must be above 0 and at most half the strike step "
+                                        f"({config.INDEXES[n]['strike_interval'] // 2}).")
+                    return
+            for n, inp in band_inputs.items():
+                v = float(inp.value)
+                config.INDEXES[n]["near_band"] = int(v) if v == int(v) else v
+            band_label.set_text("Currently: " + ", ".join(f"{n} ±{c['near_band']}" for n, c in config.INDEXES.items()))
+            log(f"[{datetime.now().strftime('%H:%M:%S')}] Near-strike band set: {band_label.text[11:]}")
 
-        ui.button("Save Strike Count", on_click=save_strike_count).classes("w-full")
+        ui.button("Save Band", on_click=save_bands).classes("w-full")
         
         # ---------------------------------------------------- NEW RESCAN BUTTON
         def force_rescan():
@@ -262,7 +278,7 @@ def main_page():
                     with ui.row().classes("gap-6 items-center"):
                         ui.label(name).classes("text-xl font-bold")
                         ltp_label = ui.label(f"{name} LTP: --")
-                        window_label = ui.label("Window: --")
+                        window_label = ui.label("Near strike: --")
 
                     pending_tracks = []
                     # CE = PE (LTP crossing), with its own on/off checkbox
@@ -394,8 +410,12 @@ def main_page():
                                     p["ce_pe_label"].set_text(f"CE = PE: cooldown ({summary.get('cooldown_remaining')}s left)")
                                 else:
                                     p["ce_pe_label"].set_text("CE = PE: scanning")
-                                if summary.get("window"):
-                                    p["window_label"].set_text(f"Window: {min(summary['window'])} - {max(summary['window'])}")
+                                if not market_open:
+                                    p["window_label"].set_text("Near strike: --")
+                                elif summary.get("near_strike") is not None:
+                                    p["window_label"].set_text(f"Near strike: {summary['near_strike']} (checking CE = PE)")
+                                else:
+                                    p["window_label"].set_text(f"Near strike: none (±{config.INDEXES[name]['near_band']}) - not checking")
                                 p["handle_scan"](summary)
                                 p["process_followups"]()
                             except Exception as ex:
@@ -410,7 +430,7 @@ def main_page():
         # ======================================================== BACKTEST TAB
         with ui.tab_panel(backtest_tab):
             ui.label("Replay today's (or any day in the current expiry cycle's) "
-                     "raw rounded CE = PE crossings, checked every 1-minute candle (NIFTY only). "
+                     "raw rounded CE = PE crossings at the near strike, checked every 1-minute candle (NIFTY only). "
                      "Cooldown is ignored here \u2014 every crossing is shown.").classes("text-sm text-gray-600")
 
             bt_expiry_label = ui.label("Expiry: not loaded")
@@ -475,8 +495,8 @@ def main_page():
         # ======================================================== REPLAY TAB
         with ui.tab_panel(replay_tab):
             ui.label("Replay a past day: runs the live CE = PE scanner minute by minute on Upstox historical candles "
-                     "(window re-centred every minute, 5-minute cooldown after a match, each match judged on its "
-                     "5-minute candle). Uses the strike count from the side panel. No alerts; the live scan keeps running. "
+                     "(CE = PE at the near strike only, within the band set in the side panel; 5-minute cooldown after a match; "
+                     "each match judged on its 5-minute candle). No alerts; the live scan keeps running. "
                      "Only days of the current weekly expiry can be replayed (older contracts have expired).") \
                 .classes("text-sm text-gray-600")
 

@@ -3,10 +3,10 @@ replay.py - "Replay a past day" for the CE = PE (LTP Crossing) scanner.
 
 Runs the LIVE scanner code (scanner.run_scan_cycle + StateManager + tracker) over one past trading day, minute by
 minute, using Upstox historical candles instead of live quotes:
-  - every 1-minute candle is one scan: the index close of that minute re-centres the strike window (as the live
-    RECALC_INTERVAL_SECONDS = 60 does) and each tracked strike's CE / PE "LTP" is its 1-minute close
-    (the last traded close is carried forward if a leg did not trade in that minute);
-  - the 5-minute cooldown after a match freezes the window and hides further matches, exactly like live;
+  - every 1-minute candle is one scan: the index close of that minute is the index LTP. If it is near a strike
+    (strike - near_band < LTP <= strike + near_band) that strike's CE / PE "LTP" is its 1-minute close (the last
+    traded close is carried forward if a leg did not trade in that minute); between bands nothing is checked;
+  - the 5-minute cooldown after a match hides further matches, exactly like live;
   - every match is then judged on its 5-minute candle by tracker.py ("Closed Above", Valid / Invalid).
 No toasts, no browser notifications. The live scanner is untouched and keeps running.
 
@@ -20,6 +20,7 @@ from datetime import datetime, timedelta
 
 import config
 import market_utils
+import match_logic
 import scanner
 import tracker
 from state_manager import StateManager
@@ -122,7 +123,7 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
 
     rc = ReplayClient(client, date_str, expiry, cfg["underlying_key"])
     sm = StateManager(name)
-    found, strikes_seen = [], set()
+    found, strikes_seen, near_scans = [], set(), 0
     for c in index_candles:
         label = c[0][:16]
         rc.set_minute(label)
@@ -132,17 +133,20 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
                                          index_ltp=float(c[4]), now=now)
         for e in summary["errors"]:
             rc.errors.append(f"{label[11:]} {e}")
-        strikes_seen.update(summary.get("window") or [])
+        near = match_logic.near_strike(float(c[4]), cfg["strike_interval"], cfg.get("near_band", 10))
+        if near is not None:                   # counted here: the scan skips this step while in cooldown
+            strikes_seen.add(near)
+            near_scans += 1
         for m in summary["matches"]:
-            found.append((label, m, list(summary["window"] or [])))
+            found.append((label, m, float(c[4])))
 
     # judge every match on its 5-minute candle (tracker.py, same rule as live)
     pending, rows = [], []
-    for row_id, (label, m, window) in enumerate(found):
+    for row_id, (label, m, index_ltp) in enumerate(found):
         start, end = tracker.bucket_bounds(IST.localize(datetime.strptime(label, "%Y-%m-%dT%H:%M")))
         rows.append({"id": row_id, "time": label[11:16], "ce_strike": m.ce_strike, "pe_strike": m.pe_strike,
                      "ce_ltp": round(m.ce_ltp, 2), "pe_ltp": round(m.pe_ltp, 2), "price": m.price,
-                     "window": f"{min(window)} - {max(window)}" if window else "",
+                     "index_ltp": round(index_ltp, 2),
                      "check_till": end.strftime("%H:%M"), "closed_above": "", "result": "", "state": ""})
         pending.append(tracker.PendingTrack(row_id=row_id, ce_strike=m.ce_strike, pe_strike=m.pe_strike,
                                             price=m.price, expiry=expiry, bucket_start=start, bucket_end=end,
@@ -157,7 +161,7 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
     out["rows"] = rows
     out["strikes"] = sorted(strikes_seen)
     out["info"] = (f"REPLAY {name} {day:%a %d %b %Y} · expiry {expiry} · {len(index_candles)} one-minute scans · "
-                   f"window {config.STRIKES_EACH_SIDE * 2 + 1} strikes (centre ± {config.STRIKES_EACH_SIDE}) · "
+                   f"near a strike (± {cfg.get('near_band', 10)}) in {near_scans} of them · "
                    f"{len(rows)} match(es): {valid} valid, {len(rows) - valid} invalid / no data"
                    + (f" · {len(rc.errors)} data error(s), see log" if rc.errors else ""))
     return out
