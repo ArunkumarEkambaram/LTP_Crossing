@@ -1,0 +1,75 @@
+# CLAUDE.md: LTP Crossing project context (read at the start of every session)
+
+Repo: `ArunkumarEkambaram/LTP_Crossing` (default branch `master`).
+Run: `python app.py` → http://localhost:8082. Needs the packages in `requirements.txt` (NiceGUI, requests, openpyxl, pytz).
+Related repo (reference only, do not change): `ArunkumarEkambaram/BEP-AlgoDelta` (its `replay.py` was the model for this
+project's Replay).
+
+## What the app is
+A NiceGUI app that watches NIFTY (and optionally SENSEX) weekly options for **LTP Crossing (CE = PE)**: inside a small
+window of strikes around the index, any rounded CE price equal to any rounded PE price is a match. Data comes from the
+Upstox API. **Only CE = PE is in scope:** BEP Support, AlgoDelta auto-orders and Telegram were removed on purpose
+(PR #1). Don't add them back unless the user asks.
+
+## Working rules agreed with the user
+- Work on a branch, open a PR, and merge **only when the user says "merge the pull request"**. No direct pushes to `master`.
+- After a merge the user runs `git checkout master` and `git pull`, then restarts the app.
+- `__pycache__/` and `*.pyc` are git-ignored; never commit them. `.gitignore` also keeps `/Working Project_13_10_2026`.
+- The cloud session can't delete GitHub branches (proxy 403). The user deletes merged branches on GitHub.
+- There is no Upstox token in the cloud session: test with a fake client (see "Testing") and say that real data is untested.
+
+## Rules of the CE = PE scan
+- **Match rule** (`match_logic.py`, shared by live, replay and backtest): every CE and PE price in the window is rounded
+  half-up (130.50 → 131). Any rounded CE equal to any rounded PE is a match; the strikes may differ.
+- **Strike window:** nearest strike to the index LTP ± `STRIKES_EACH_SIDE` (default 2 → 5 strikes; side panel slider).
+  Strike step: NIFTY 50, SENSEX 100. Re-centred every `RECALC_INTERVAL_SECONDS` (60 s).
+- **Scan:** every `SCAN_INTERVAL_SECONDS` (10 s, side panel), only during market hours (`MARKET_OPEN` 09:15 –
+  `MARKET_CLOSE` 15:40 IST, weekdays, not `MARKET_HOLIDAYS`).
+- **Cooldown:** after a match the window freezes and further matches are hidden for `COOLDOWN_SECONDS` (5 min). All
+  matches found in the same scan are recorded.
+- **Follow-up check** (`tracker.py`): each match is judged on the 5-minute candle (09:15 grid) that contains it. For each
+  leg: above = close > rounded price, red = open > close. Any leg closing above in a RED candle → Invalid; else a leg
+  closing above in a green candle → Valid; else Invalid. Candle missing after `TRACK_GIVE_UP_SECONDS` → "No data".
+- **Alerts** (`notifier.py`): on-screen toast + browser notification per match, only if `MATCH_ALERTS_ENABLED` (True)
+  and not paused (Pause alerts button, `ALERTS_PAUSED`). No Telegram.
+
+## Files
+- `app.py`: the UI (single page, port 8082).
+  - Side panel: Upstox token (Save & Test Connection), Scanner (strike count, Rescan, scan interval).
+  - Top bar: Pause alerts, NIFTY / SENSEX checkboxes.
+  - Tabs: **Live Scanner** (per index: LTP, window, CE = PE on/off, matches table, CSV/XLSX), **Replay**, **Backtest**.
+  - Log panel at the bottom: repeated messages within the last 20 lines merge into one line with an `(xN)` counter;
+    20 lines shown, 200 kept.
+- `scanner.py`: `run_scan_cycle(client, state_mgr, ..., now=None)`, one scan of one index. `now` is used by replay.
+- `state_manager.py`: window re-centring, freeze / cooldown (one `StateManager` per index).
+- `match_logic.py`: the match rule. `models.py`: `StrikeWindow`, `MatchEvent`, `ScanState`.
+- `tracker.py`: the 5-minute follow-up check.
+- `replay.py`: **Replay a past day** (see below).
+- `backtest.py`: Backtest tab, NIFTY only. Lists every raw crossing on 1-minute closes over a fixed window (union of the
+  open and close windows), **cooldown ignored**.
+- `market_utils.py`: market hours, strike window, expiry helpers (`expiry_cycle_dates` = days that can be replayed),
+  cached option instrument keys.
+- `upstox_client.py`: Upstox REST calls (LTP, option chain, contracts, 1-minute / N-minute / daily candles).
+- `notifier.py`: toasts + browser notifications. `export_utils.py`: CSV / XLSX downloads.
+- `config.py`: all settings above. `test_option_chain.py`: standalone check of the option-chain response.
+
+## Replay (PR #2)
+- Replay tab: index + date (Load dates lists the current weekly expiry cycle) → Replay. No alerts; the live scan keeps
+  running.
+- `ReplayClient` wraps the Upstox client for one day, and the **live code** runs on it, one scan per 1-minute candle
+  09:15–15:29: index close = LTP (window re-centred every minute), each leg's 1-minute close = its LTP (last close
+  carried forward if it didn't trade that minute), same cooldown, then `tracker.process_pending` on that day's
+  5-minute candles. Keep replay going through the live code so the two never drift apart.
+- Table: Time, CE/PE strike, CE/PE LTP, Rounded Price, Window, Checked Till, Closed Above, Result (green = Valid,
+  red = Invalid / No data). CSV/XLSX download.
+- Limits: only days of the current weekly expiry (older contracts' keys are no longer listed by Upstox); one price per
+  minute, so a crossing lasting only seconds inside a minute is missed (live scans every 10 s).
+
+## Testing (no Upstox token in the cloud)
+- Unit-test logic with a fake client class that returns made-up candles / contracts / expiries.
+- UI check: run the app with `upstox_client.UpstoxClient` and `upstox_client.test_connection` patched to the fake, then
+  drive it with Playwright (Chromium is pre-installed) and look at a screenshot.
+
+## Open / not yet verified
+- Replay against real Upstox data (needs the user's token).
+- Backtest is NIFTY only; Replay supports NIFTY and SENSEX.
