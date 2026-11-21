@@ -7,7 +7,8 @@ minute, using Upstox historical candles instead of live quotes:
     (nearest strike +/- STRIKES_EACH_SIDE); each window strike's CE / PE "LTP" is its 1-minute close (the last
     traded close is carried forward if a leg did not trade in that minute);
   - the 5-minute cooldown after a match hides further matches, exactly like live;
-  - every match is then judged on its 5-minute candle by tracker.py ("Closed Above", Valid / Invalid).
+  - every match is then watched for 6 five-minute candles by tracker.py (breakout then hold: Valid / Failed /
+    Invalid (red) / None). On today's date, matches whose 6 candles haven't all closed stay "WATCHING n/6".
 No toasts, no browser notifications. The live scanner is untouched and keeps running.
 
 Limits:
@@ -16,6 +17,7 @@ Limits:
   - Live scans every SCAN_INTERVAL_SECONDS (10 s); the replay sees one price per minute, so a crossing that
     lasted only a few seconds inside a minute is not seen.
 """
+from collections import Counter
 from datetime import datetime, timedelta
 
 import config
@@ -136,28 +138,32 @@ def run(client, name: str, date_str: str, log_fn=print) -> dict:
         for m in summary["matches"]:
             found.append((label, m, float(c[4])))
 
-    # judge every match on its 5-minute candle (tracker.py, same rule as live)
+    # watch every match for 6 five-minute candles (tracker.py, same rule as live)
     pending, rows = [], []
     for row_id, (label, m, index_ltp) in enumerate(found):
         start, end = tracker.bucket_bounds(IST.localize(datetime.strptime(label, "%Y-%m-%dT%H:%M")))
         rows.append({"id": row_id, "time": label[11:16], "ce_strike": m.ce_strike, "pe_strike": m.pe_strike,
                      "ce_ltp": round(m.ce_ltp, 2), "pe_ltp": round(m.pe_ltp, 2), "price": m.price,
                      "index_ltp": round(index_ltp, 2),
-                     "check_till": end.strftime("%H:%M"), "closed_above": "", "result": "", "state": ""})
+                     "check_till": tracker.watch_end(start).strftime("%H:%M"), "closed_above": "", "best": "",
+                     "result": f"WATCHING 0/{tracker.watch_candles()}", "state": "watching"})
         pending.append(tracker.PendingTrack(row_id=row_id, ce_strike=m.ce_strike, pe_strike=m.pe_strike,
                                             price=m.price, expiry=expiry, bucket_start=start, bucket_end=end,
                                             underlying_key=cfg["underlying_key"]))
     end_of_day = IST.localize(day.replace(hour=23, minute=59))
-    for row_id, fields, _final in tracker.process_pending(rc, pending, end_of_day):
+    judge_at = min(end_of_day, datetime.now(IST))      # today: only candles that have closed
+    for row_id, fields, _final in tracker.process_pending(rc, pending, judge_at):
         rows[row_id].update(fields)
 
     for e in rc.errors[:20]:
         log_fn(f"REPLAY {name} {date_str}: {e}")
-    valid = sum(1 for r in rows if r["state"] == "valid")
+    cnt = Counter(r["state"] for r in rows)
     out["rows"] = rows
     out["strikes"] = sorted(strikes_seen)
     out["info"] = (f"REPLAY {name} {day:%a %d %b %Y} · expiry {expiry} · {len(index_candles)} one-minute scans · "
                    f"strikes checked: nearest ± {config.STRIKES_EACH_SIDE} · "
-                   f"{len(rows)} match(es): {valid} valid, {len(rows) - valid} invalid / no data"
+                   f"{len(rows)} match(es): {cnt['valid']} valid, {cnt['failed']} failed, {cnt['invalid']} invalid / none"
+                   + (f", {cnt['watching']} still watching" if cnt['watching'] else "")
+                   + (f", {cnt['nodata']} no data" if cnt['nodata'] else "")
                    + (f" · {len(rc.errors)} data error(s), see log" if rc.errors else ""))
     return out

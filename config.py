@@ -28,6 +28,7 @@ RECALC_INTERVAL_SECONDS = 60      # re-center the strike window every 1 min
 # Candle timing used by the CE = PE follow-up check (tracker.py)
 TRACK_FINALIZE_DELAY_SECONDS = 10   # wait this long after a 5-min candle closes before reading it
 TRACK_GIVE_UP_SECONDS = 180         # if the candle is still missing after this, stop waiting for it
+TRACK_WATCH_CANDLES = 6             # watch the match candle + the next 5 (30 min) before Valid / Failed / None
 
 # Upstox
 UPSTOX_ACCESS_TOKEN = ""   # paste a pre-generated access token
